@@ -31,10 +31,10 @@ import os
 import uuid
 
 ###################################################################################
-def setPasswordSSO(app_id, app_details, sso_url, headers):
+def setPasswordSSO(app_id, app_name, sso_url, headers):
     ## no idea how to make this work
-    print(f"Setting password-based SSO for ${app_name} with URL ${sso_url}")
-    # Set the application to password-based SSO and update the SSO URL
+    print(f"Setting password-based SSO for {app_name} with URL {sso_url}")
+    ## this is hint from chat-gpt but no worky
     # body = {
     #     "preferredSingleSignOnMode": "password",
     #     "passwordSingleSignOn": {
@@ -55,6 +55,11 @@ def setPasswordSSO(app_id, app_details, sso_url, headers):
     #     print(json.dumps(body, indent=4))
     #     print(json.dumps(response.json(), indent=4))
     #     exit (1);
+
+###################################################################################
+def getAppUsersGroups(app_id, app_name, headers):
+    ## no idea how to make this work
+    print(f"Getting Users/Groups assigned to {app_name}")
 
 ###################################################################################
 def addAppRole(app_name, app_id, app_details, headers, DEBUG): 
@@ -286,7 +291,10 @@ appRoleUUID = addAppRole(app_name, app_id, app_details, headers, DEBUG)
 ## we will actually need to create groups and populate with users - but for now, just add an existing group
 group_id = addGroupToApp(group_name, app_name, app_id, app_aid, appRoleUUID, service_principal_id, headers, DEBUG)
 
-## now we need to set the password on that group
+## here we get the users && groups for the app so we can set the password for them
+getAppUsersGroups(app_id, app_name, headers)
+
+## now we need to set the password on a group
 username = "new_username"
 password = "new_password"
 updateGroupCredentials(group_id, appRoleUUID, service_principal_id, username, password, headers, DEBUG)
