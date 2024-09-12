@@ -57,9 +57,26 @@ def setPasswordSSO(app_id, app_name, sso_url, headers):
     #     exit (1);
 
 ###################################################################################
-def getAppUsersGroups(app_id, app_name, headers):
-    ## no idea how to make this work
+def getAppUsersGroups(app_id, app_aid, app_name, service_principal_id, headers):
     print(f"Getting Users/Groups assigned to {app_name}")
+    next_uri = f"{graph_api_url}/v1.0/servicePrincipals/{service_principal_id}/appRoleAssignedTo"
+    response = requests.get(
+        next_uri,
+        headers=headers,
+    )
+    if response.status_code != 200:
+        print("Failed to retrieve users/groups assigned to application")
+        print(f"URI: {next_uri}")
+        print(json.dumps(response.json(), indent=4))
+        exit(1)
+
+    response_json = response.json()
+    if "value" in response_json and len(response_json["value"]) > 0:
+        return response_json["value"]
+    else:
+        print("No users/groups assigned to the application")
+        return []
+
 
 ###################################################################################
 def addAppRole(app_name, app_id, app_details, headers, DEBUG): 
@@ -222,7 +239,8 @@ def getAppServicePrincipal(app_name, headers, DEBUG):
     return service_principal_id
 
 ###################################################################################
-def updateGroupCredentials(group_id, appRoleUUID, service_principal_id, username, password, headers, DEBUG):
+def updateGroupCredentials(group_id, appRoleUUID, service_principal_id, principal_display_name, username, password, headers, DEBUG):
+    print(f"Updating credentials for group {group_id} for the {principal_display_name} user")
     ### THIS NO WORKING
     credentials = {
         "principalId": group_id,
@@ -292,11 +310,13 @@ appRoleUUID = addAppRole(app_name, app_id, app_details, headers, DEBUG)
 group_id = addGroupToApp(group_name, app_name, app_id, app_aid, appRoleUUID, service_principal_id, headers, DEBUG)
 
 ## here we get the users && groups for the app so we can set the password for them
-getAppUsersGroups(app_id, app_name, headers)
+assigned_users_groups = getAppUsersGroups(app_id, app_aid, app_name, service_principal_id, headers)
 
 ## now we need to set the password on a group
 username = "new_username"
 password = "new_password"
-updateGroupCredentials(group_id, appRoleUUID, service_principal_id, username, password, headers, DEBUG)
-
+for item in assigned_users_groups:
+    # item is a json object with the following keys we can use: id, deletedDateTime, appRoleId, createdDateTime, principalDisplayName, principalId, principalType, resourceDisplayName, resourceId
+    principal_display_name = item.get("principalDisplayName")
+    updateGroupCredentials(group_id, appRoleUUID, service_principal_id, principal_display_name, username, password, headers, DEBUG)
 
