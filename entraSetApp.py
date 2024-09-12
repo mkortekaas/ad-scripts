@@ -31,30 +31,36 @@ import os
 import uuid
 
 ###################################################################################
-def setPasswordSSO(app_id, app_name, sso_url, headers):
+def setPasswordSSO(app_id, app_name, service_principal_id, sso_url, headers):
     ## no idea how to make this work
     print(f"Setting password-based SSO for {app_name} with URL {sso_url}")
-    ## this is hint from chat-gpt but no worky
-    # body = {
-    #     "preferredSingleSignOnMode": "password",
-    #     "passwordSingleSignOn": {
-    #         "fieldValues": [
-    #             {
-    #                 "name": "loginUrl",
-    #                 "value": sso_url
-    #             }
-    #         ]
-    #     }
-    # }
-    # response = requests.patch(f"{graph_api_url}/v1.0/applications/{app_id}", headers=headers, json=body)
-    # if response.status_code == 204:
-    #     print(f"Application {app_name} is now set to password-based SSO")
-    # else:
-    #     print(f"ERROR Failed to set SSO mode for application {app_name}")
-    #     print(f"URI: {graph_api_url}/{app_id}")
-    #     print(json.dumps(body, indent=4))
-    #     print(json.dumps(response.json(), indent=4))
-    #     exit (1);
+
+    ### chatgpt recommended this but this does not work:
+    # body = { "web": { "redirectUris": [] } }
+    # next_uri = f"{graph_api_url}/v1.0/applications/{app_id}"
+
+    # tried both passwordSingleSignOn and passwordSingleSignOnSettings - both throw a  "Invalid property 'passwordSingleSignOnSettings'.", error
+    body = {
+        "preferredSingleSignOnMode": "password",
+        "passwordSingleSignOnSettings": {
+            "fieldValues": [
+                {
+                    "name": "loginUrl",
+                    "value": sso_url
+                }
+            ]
+        }
+    }
+    next_uri = f"{graph_api_url}/v1.0/servicePrincipals/{service_principal_id}"
+    response = requests.patch(next_uri, headers=headers, json=body)
+    if response.status_code == 204:
+        print(f"Application {app_name} is now set to password-based SSO")
+    else:
+        print(f"ERROR Failed to set SSO mode for application {app_name}")
+        print(f"URI: {next_uri}")
+        print(json.dumps(body, indent=4))
+        print(json.dumps(response.json(), indent=4))
+        exit (1);
 
 ###################################################################################
 def getAppUsersGroups(app_id, app_aid, app_name, service_principal_id, headers):
@@ -273,7 +279,7 @@ parser = argparse.ArgumentParser(description="Set up an application for password
 parser.add_argument("--tenant_id", help="Azure AD tenant ID", default=os.getenv("TENANT_ID"))
 parser.add_argument("--client_id", help="Azure AD client ID", default=os.getenv("CLIENT_ID"))
 parser.add_argument("--client_secret", help="Azure AD client secret", default=os.getenv("CLIENT_SECRET"))
-parser.add_argument("--DEBUG", help="Enable debug output", action="store_true")
+parser.add_argument("--DEBUG", help="Enable debug output", action="store_true", default=True)
 parser.add_argument("--app_name", help="Application name", default=os.getenv("APP_NAME"))
 parser.add_argument("--sso_url", help="SSO URL", default=os.getenv("SSO_URL"))
 parser.add_argument("--group_name", help="GROUP NAME", default=os.getenv("GROUP_NAME"))
@@ -301,7 +307,7 @@ headers = {
 (app_info, app_details, app_id, app_aid) = getAppDetails(app_name, headers)
 service_principal_id = getAppServicePrincipal(app_name, headers, DEBUG)
 
-setPasswordSSO(app_id, app_name, sso_url, headers)
+setPasswordSSO(app_id, app_name, service_principal_id, sso_url, headers)
 
 ## we have already done this a bunch of times - just hardcoding during testing
 appRoleUUID = addAppRole(app_name, app_id, app_details, headers, DEBUG)
