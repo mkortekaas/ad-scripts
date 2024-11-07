@@ -230,62 +230,99 @@ class EntraClient:
     ###########################################################################################
     class Applications:
         def __init__(self, client):
-            self.client = client
+            self.client           = client
+            self.cache            = {}
+            self.apps_cache_dir = None
+            if (self.client.cache_dir is not None):
+                self.apps_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_apps')
+            if (self.client.cache_dir is not None):
+                self.sp_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
 
         def get_details(self, app):
+            if app is None:
+                return None
+            
+            encoded_app_name = urllib.parse.quote(app)
             if self.client.__is_valid_uuid__(app):
                 ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
                 # next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app}"
                 next_uri = f"{self.client.graph_api_url}/v1.0/applications?$filter=id eq '{app}'"
             else:
-                encoded_app_name = urllib.parse.quote(app)
                 next_uri = f"{self.client.graph_api_url}/v1.0/applications?$filter=displayName eq '{encoded_app_name}'"
+
+            if self.apps_cache_dir is not None:
+                app_file_name = f"{self.apps_cache_dir}/{urllib.parse.quote(app, safe='')}"
+                if os.path.exists(app_file_name):
+                    with open(app_file_name, "r") as f:
+                        data = json.load(f)
+                        return data
 
             response = requests.get(next_uri, headers=self.client.headers)
             if response.status_code != 200:
                 self.client.logger.debug(f"{self.__class__.__name__}({app}) Failed to retrieve application information")
-                return None, None, None, None
+                return None
 
-            app_info = response.json()
-            if not app_info["value"]:
+            my_app_response = response.json().get('value', [])
+            if len(my_app_response) == 0:
                 self.client.logger.debug(f"{self.__class__.__name__}({app}) not found")
-                return None, None, None, None
-
-            app_id = app_info["value"][0]["id"]
-            app_aid = app_info["value"][0]["appId"]
-            self.client.logger.debug(f"{self.__class__.__name__}({app}) found with ID {app_id} and AppID {app_aid}")
-
-            next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app_id}"
-            response = requests.get(next_uri, headers=self.client.headers)
-            if response.status_code != 200:
-                self.client.logger.debug(f"{self.__class__.__name__}({app}) Failed to retrieve detailed application information")
-                return None, None, None, None
-
-            app_details = response.json()
-            return app_info, app_details, app_id, app_aid
+                ## for apps we don't write failed
+                return None
             
-        def get_service_principal(self, app_name):
+            my_app = my_app_response[0]
+            if self.apps_cache_dir is not None:
+                self.client.logger.debug(f"-a-a-a- Writing into disk cache: ({app})")
+                with open(app_file_name, "w") as f:
+                    json.dump(my_app, f)
+            return my_app
+        
+        def get_id(self, app_name):
+            app_info = self.get_details(app_name)
+            if app_info is None:
+                return None
+            return app_info.get("id")
+        
+        def get_aid(self, app_name):
+            app_info = self.get_details(app_name)
+            if app_info is None:
+                return None
+            return app_info.get("appId")
+            
+        def get_service_principal_details(self, app_name):
             encoded_app_name = urllib.parse.quote(app_name)
             service_principal_url = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=displayName eq '{encoded_app_name}'"
+            if self.apps_cache_dir is not None:
+                sp_file_name = f"{self.sp_cache_dir}/{urllib.parse.quote(app_name, safe='')}"
+                if os.path.exists(sp_file_name):
+                    with open(sp_file_name, "r") as f:
+                        data = json.load(f)
+                        return data
             response = requests.get(service_principal_url, headers=self.client.headers)
             if response.status_code != 200:
                 self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Failed to retrieve service principal information")
-                return (None, None)
-
+                return None
             service_principal_info = response.json()
             if not service_principal_info["value"]:
                 self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Service principal not found")
-                return (None, None)
-
+                return None
             service_principal_id = service_principal_info["value"][0]["id"]
             self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Service principal ID is {service_principal_id}")
-            return (service_principal_id, service_principal_info)
+            if self.apps_cache_dir is not None:
+                self.client.logger.debug(f"-a-a-a- Writing into disk cache: ({app_name})")
+                with open(sp_file_name, "w") as f:
+                    json.dump(service_principal_info["value"][0], f)
+            return service_principal_info["value"][0]
+        
+        def get_service_principal_id(self, app_name):
+            sp_info = self.get_service_principal_details(app_name)
+            if sp_info is None:
+                return None
+            return sp_info["id"]
             
         def get_sso_type(self, app_name):
-            (service_principal_id, sp_info) = self.get_service_principal(app_name)
-            if service_principal_id is None:
+            sp_info = self.get_service_principal_details(app_name)
+            if sp_info is None:
                 return None
-            return sp_info.get('value')[0].get('preferredSingleSignOnMode')
+            return sp_info.get('preferredSingleSignOnMode')
         
         def disable_sso(self, service_principal_id):
             self.client.logger.info(f"Disabling SSO for service principal {service_principal_id}")
@@ -368,7 +405,7 @@ class EntraClient:
             return app_details
         
         def __add_group__(self, group_name, app_name, app_id, app_details):
-            (service_principal_id, sp_info) = self.get_service_principal(app_name)
+            service_principal_id = self.get_service_principal_id(app_name)
             existing_assignments = self.get_users_groups(app_name, service_principal_id)
             self.client.logger.debug(f"{self.__class__.__name__}({group_name}) existing_assignments: {existing_assignments}")
             if existing_assignments is None:
@@ -517,7 +554,7 @@ class EntraClient:
         
         def set_note(self, app, key, value):
             if self.client.__is_valid_uuid__(app):
-                (app_info, app_details, app_id, app_aid) = self.get_details(app)
+                app_id = self.get_id(app)
             else:
                 app_id = app
             if not app_id:
@@ -554,7 +591,7 @@ class EntraClient:
         
         def get_note(self, app):
             if self.client.__is_valid_uuid__(app):
-                (app_info, app_details, app_id, app_aid) = self.get_details(app)
+                app_id = self.get_id(app)
             else:
                 app_id = app
             self.client.logger.debug(f"{self.__class__.__name__}({app_id})")
@@ -582,7 +619,7 @@ class EntraClient:
 
         def confirm_note(self, app, key, value):
             if self.client.__is_valid_uuid__(app):
-                (app_info, app_details, app_id, app_aid) = self.get_details(app)
+                app_id = self.get_id(app)
             else:
                 app_id = app
             self.client.logger.debug(f"{self.__class__.__name__}({app_id}) {key} / {value}")
@@ -610,7 +647,7 @@ class EntraClient:
             if (self.client.cache_dir is not None):
                 self.groups_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups')
 
-        def get_details(self, group, write_failed=True):
+        def get_details(self, group):
             if group is None:
                 return None
             if self.groups_cache_dir is not None:
@@ -619,9 +656,6 @@ class EntraClient:
                     with open(group_file_name, "r") as f:
                         data = json.load(f)
                         return data
-                group_failed_file_name = f"{self.groups_cache_dir}/{urllib.parse.quote(group, safe='')}.failed"
-                if os.path.exists(group_failed_file_name):
-                    return None
 
             encoded_group_name = urllib.parse.quote(group)
             next_uri = f"{self.client.graph_api_url}/v1.0/groups?$filter=displayName eq '{encoded_group_name}'"
@@ -634,9 +668,6 @@ class EntraClient:
             groups = response.json().get('value', [])
             if len(groups) == 0:
                 self.client.logger.debug(f"{self.__class__.__name__} Failed to get group for '{group}': {response.text}")
-                if self.groups_cache_dir is not None and write_failed is True:
-                    with open(group_failed_file_name, "w") as f:
-                        f.write("FAILED")
                 return None
 
             if self.groups_cache_dir is not None:
