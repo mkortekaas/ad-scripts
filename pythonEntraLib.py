@@ -289,14 +289,19 @@ class EntraClient:
             
         def get_service_principal_details(self, app_name):
             encoded_app_name = urllib.parse.quote(app_name)
-            service_principal_url = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=displayName eq '{encoded_app_name}'"
+            if self.client.__is_valid_uuid__(app_name):
+                ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
+                # next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app}"
+                next_uri = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=id eq '{app_name}'"
+            else:
+                next_uri = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=displayName eq '{encoded_app_name}'"
             if self.apps_cache_dir is not None:
                 sp_file_name = f"{self.sp_cache_dir}/{urllib.parse.quote(app_name, safe='')}"
                 if os.path.exists(sp_file_name):
                     with open(sp_file_name, "r") as f:
                         data = json.load(f)
                         return data
-            response = requests.get(service_principal_url, headers=self.client.headers)
+            response = requests.get(next_uri, headers=self.client.headers)
             if response.status_code != 200:
                 self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Failed to retrieve service principal information")
                 return None
@@ -482,7 +487,16 @@ class EntraClient:
                 return None
             owners= response.json().get('value', [])
             return owners
-        
+        def owners_fetch_appregistration(self, app_id):
+            return self.__owners_fetch__(app_id, "applications")
+        def owners_fetch(self, service_principal_id):
+            return self.__owners_fetch__(service_principal_id, "servicePrincipals")
+        def owners_fetch_oids(self, service_principal_id):
+            owners = self.__owners_fetch__(service_principal_id, "servicePrincipals")
+            if owners is None:
+                return None
+            return [owner['id'] for owner in owners]
+
         ###################################################################################
         ## For the avoidance of doubt: while the user interface talks about "Enterprise Applications" and "App Registrations",
         ## Under the hood:
@@ -510,7 +524,7 @@ class EntraClient:
                 # print(f"payload: {payload}")
                 response = requests.post(next_uri, headers=self.client.headers, json=payload)
                 if response.status_code == 204:
-                    self.client.logger.info(f"{self.__class__.__name__}({id})({user_oid}) added")
+                    self.client.logger.info(f"{self.__class__.__name__}({id})({user_oid}) added owner")
                 else:
                     self.client.logger.warning(f"{self.__class__.__name__}({id})({user_oid}) Error adding owner")
                     status = False
@@ -530,7 +544,7 @@ class EntraClient:
                     next_uri = f"{self.client.graph_api_url}/v1.0/{function}/{id}/owners/{user_oid}/$ref"
                     response = requests.delete(next_uri, headers=self.client.headers)
                     if response.status_code == 204:
-                        self.client.logger.info(f"{self.__class__.__name__}({id})({function})({user_oid}) removed")
+                        self.client.logger.info(f"{self.__class__.__name__}({id})({function})({user_oid}) removed owner")
                     else:
                         self.client.logger.warning(f"{self.__class__.__name__}({id})({function})({user_oid}) Error removing owner")
                         status = False
@@ -753,6 +767,11 @@ class EntraClient:
                 self.client.logger.info(f"{self.__class__.__name__}({group_id}) No group owners")
                 return None
             return response.json()
+        def owners_fetch_oids(self, group_id):
+            owners = self.owners_fetch(group_id)
+            if owners is None:
+                return None
+            return [owner['id'] for owner in owners['value']]
         
         def owners_add(self, group_id, user_oids):
             group_owners = self.owners_fetch(group_id)

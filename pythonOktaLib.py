@@ -39,6 +39,7 @@ class OktaInfo:
         self.logger                  = logging.getLogger('__COMMONLOGGER__')
         self.OKTA_DOMAIN             = OKTA_DOMAIN
         self.GLOBAL_RATE_LIMIT       = GLOBAL_RATE_LIMIT
+        self.total_apps_to_fetch     = 999999
         self.LIMIT_APPS              = 200
         self.LIMIT_USERS             = 500
         self.LIMIT_GROUPS            = 200
@@ -200,7 +201,7 @@ class OktaInfo:
     def apps_fetch(self, STOP_LIMIT=None):
         count     = 0
         apps_list = []
-        my_limit  = self.LIMIT_APPS
+        my_limit  = self.total_apps_to_fetch
         if STOP_LIMIT is not None:
             my_limit = STOP_LIMIT
         json_files = glob.glob(os.path.join(self.dir_app_info, '*.json'))
