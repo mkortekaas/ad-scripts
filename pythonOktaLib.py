@@ -34,7 +34,7 @@ import re
 
 ###################################################################################
 class OktaInfo:
-    def __init__ (self, CACHE_DIR, OKTA_DOMAIN=None, OKTA_TOKEN=None, GLOBAL_RATE_LIMIT=48):
+    def __init__ (self, CACHE_DIR, OKTA_DOMAIN=None, OKTA_TOKEN=None, GLOBAL_RATE_LIMIT=48, FLUSH=False):
         ## make sure that other modules are calling with same logger name
         self.logger                  = logging.getLogger('__COMMONLOGGER__')
         self.OKTA_DOMAIN             = OKTA_DOMAIN
@@ -48,6 +48,10 @@ class OktaInfo:
         self.cache_groups            = {}
         self.cache_groups_users      = {}
         self.cache_apps              = {}
+
+        if FLUSH:
+            self.flush()
+
         self.__mkdirs__()
 
         ## OKTA_TOKEN can come in a few ways depending how we are called
@@ -78,9 +82,8 @@ class OktaInfo:
         return path
 
     def flush(self):
-        self.logger.info(f"OktaInfo FLUSHING CACHE in ({self.CACHE_DIR})")
+        self.logger.info(f"FLUSHING OKTA CACHE in ({self.CACHE_DIR})")
         os.system(f"rm -rf {self.CACHE_DIR}/okta_*")
-        self.__mkdirs__()
 
     def __get_headers__(self):
         ## This is called for getting headers and is a good place to check rate limits and wait here
@@ -110,21 +113,23 @@ class OktaInfo:
         response = requests.get(url, headers=self.__get_headers__())
         if response.status_code != 200:
             self.logger.error(f"Failed to retrieve {url}\tStatus code: {response.status_code}")
-            sys.exit(1)
+            return None
         return response
 
-    def __fetch_to_cache__(self, url, file_path):
+    def __fetch_to_cache__(self, url, file_path, force=False):
         if os.path.exists(file_path):
-            # self.logger.debug(f"-o-o-o- Reading from disk cache: {file_path}")
-            with open(file_path, 'r') as f:
-                json_info = json.load(f)
-                return json_info
-        else:
-            response = self.__https_get__(url)
-            self.logger.debug(f"+o+o+o+ Writing into disk cache: {file_path} ({url})")
-            with open(file_path, 'w') as f:
-                json.dump(response.json(), f)
-            return response.json()
+            if force is True:
+                os.remove(file_path)  ## this will force a refresh
+            else:
+                # self.logger.debug(f"-o-o-o- Reading from disk cache: {file_path}")
+                with open(file_path, 'r') as f:
+                    json_info = json.load(f)
+                    return json_info
+        response = self.__https_get__(url)
+        self.logger.debug(f"+o+o+o+ Writing into disk cache: {file_path} ({url})")
+        with open(file_path, 'w') as f:
+            json.dump(response.json(), f)
+        return response.json()
         
     def __is_email_address__(self, id):
         # Define a regex pattern for validating email addresses
@@ -140,7 +145,7 @@ class OktaInfo:
         return None
 
     def user(self, id):
-        self.logger.debug(f"Getting user: {id}")
+        # self.logger.debug(f"Getting user: {id}")
         if self.__is_email_address__(id):
             id = self.__get_user_id_by_email__(id)
             if id is None:
@@ -156,6 +161,72 @@ class OktaInfo:
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'clients', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'appLinks', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'grants', json_user_data['id'])
+
+    def users_fetch_all(self, STOP_LIMIT=None):
+        count     = 0
+        users_list = []
+        my_limit  = self.total_apps_to_fetch
+        if STOP_LIMIT is not None:
+            my_limit = STOP_LIMIT
+        json_files = glob.glob(os.path.join(self.dir_users, '*.json'))
+        if (len(json_files) > 0):
+            self.logger.debug(f"USING CACHED USERS: {len(json_files)}")
+            for json_file in json_files:
+                if count >= my_limit:
+                    break
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    users_list.append(data)
+                    count += 1
+        else:
+            url = f'https://{self.OKTA_DOMAIN}/api/v1/users?limit={my_limit}'
+            while True:
+                if count >= STOP_LIMIT:
+                    break
+                self.logger.info(f"========== Fetching USERS: {url} ==========")
+                response = self.__https_get__(url)
+                users = response.json()
+                users_list.extend(users)
+                for user in users:
+                    file_name = f"{self.dir_users}/{user.get('id')}.json"
+                    self.cache_user[user.get('id')] = user
+                    with open(file_name, 'w') as f:
+                        json.dump(user, f)
+
+                if 'next' in response.links:
+                    self.logger.debug(f"                          {response.links['next']} ")
+                    url = response.links['next']['url']
+                    count += len(users)
+                else:
+                    count += len(users)
+                    break
+        return users_list
+    
+    def user_login_lower_case(self, id):
+        ## this is a special case where we are changing the login name to lower case
+        ## we need to refetch from the API and then change and then a PUT
+        self.logger.debug(f"Getting user: {id}")        
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
+        response = self.__https_get__(url)
+        if response:
+            user = response.json()
+            user['profile']['login'] = user['profile']['login'].lower()
+            query = { "strict": "true" }
+            payload = {
+                "profile": {
+                    "login": user['profile']['login'].lower()
+                }
+            }
+            response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
+            if response.status_code != 200:
+                self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
+                return None
+            
+            ## clear cache file && re-write so in local cache as updated
+            file_path = f"{self.dir_users}/{id}.json"
+            with open(file_path, 'w') as f:
+                json.dump(response.json(), f)
+            return response.json()
 
     def groups(self, id):
         if id in self.cache_groups:
@@ -175,14 +246,14 @@ class OktaInfo:
         self.cache_groups_users[id] = group_users
         return group_users
     
-    def app(self, id):
+    def app(self, id, force=False):
         ### TODO - verify if other files start with the file in question....
         ###    if files were moved they will get called again and written 2nd version
-        if id in self.cache_apps:
+        if force is False and id in self.cache_apps:
             return self.cache_apps[id]
         url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}' ## GET
         file_path = f"{self.dir_app_info}/{id}.json"
-        app_info = self.__fetch_to_cache__(url, file_path)
+        app_info = self.__fetch_to_cache__(url, file_path, force)
         self.cache_apps[id] = app_info
         return app_info
 
@@ -196,6 +267,31 @@ class OktaInfo:
         if response.status_code != 200:
             self.logger.warning(f"with change: {url} - response: {response}")
             return False
+        return True
+    
+    def app_allow_reveal(self, id):
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}'
+        headers = self.__get_headers__()
+        
+        # Get the current app settings
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            self.logger.warning(f"Failed to retrieve app settings: {url} - response: {response}")
+            return False
+        
+        app_settings = response.json()
+        
+        # Update the credentials object to allow password reveal
+        app_settings['credentials']['revealPassword'] = True
+        
+        # Send the update request
+        response = requests.put(url, headers=headers, json=app_settings)
+        if response.status_code != 200:
+            self.logger.warning(f"Failed to update app settings: {url} - response: {response}")
+            return False
+        
+        self.logger.info(f"Successfully updated app settings to allow password reveal: {url}")
+        self.app(id, True)  ## force cache update post change
         return True
 
     def apps_fetch(self, STOP_LIMIT=None):
@@ -249,7 +345,7 @@ class OktaInfo:
         else:
             url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/users?limit={self.LIMIT_USERS}'       
             while url:
-                self.logger.info(f"      users       Fetching {id} USERS: {url} ")
+                self.logger.info(f"      Fetching {id} USERS:  {url} ")
                 response = self.__https_get__(url)
                 users.extend(response.json())
                 link_header = response.headers.get('Link')   # Okta uses Link headers for pagination. Extract the next page URL if present.
@@ -277,7 +373,7 @@ class OktaInfo:
         else:
             url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/groups?limit={self.LIMIT_GROUPS}'
             while url:
-                self.logger.info(f"                  Fetching {id} GROUPS: {url} ")
+                self.logger.info(f"      Fetching {id} GROUPS: {url} ")
                 response = self.__https_get__(url)
                 groups.extend(response.json())
                 link_header = response.headers.get('Link')   # Okta uses Link headers for pagination. Extract the next page URL if present.

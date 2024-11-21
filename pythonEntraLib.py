@@ -29,9 +29,10 @@ import re
 import time
 import urllib
 import os
+import glob
 
 class EntraClient:
-    def __init__(self, tenant_id, client_id, client_secret, required_scopes, graph_api_url, cache_dir=None):
+    def __init__(self, tenant_id, client_id, client_secret, required_scopes, graph_api_url, cache_dir=None, FLUSH=False):
         ## make sure that other modules are calling with same logger name
         self.logger          = logging.getLogger('__COMMONLOGGER__')
         self.tenant_id       = tenant_id
@@ -41,19 +42,29 @@ class EntraClient:
         self.graph_api_url   = graph_api_url
         self.cache_dir       = cache_dir
 
+        if FLUSH:
+            self.flush()
+
         ## subclasses
         self.Users           = self.Users(self)
         self.Applications    = self.Applications(self)
         self.Groups          = self.Groups(self)
         self.PasswordSSO     = self.PasswordSSO(self)
+        self.authenticate()
 
-        ## Now sign in and get the access token
+    def authenticate(self):
+        ## 
+        ## If your loops are very long you will eventually get a token that expires and we don't reliably check for that
+        ##  elsewhere in this module to refetch a new token. Probably should add that but for now just call authentiate() every
+        ##  so often
+        ##
+        self.logger.info("Authenticating with MS_GRAPH and getting valid token")
         app = msal.ConfidentialClientApplication(
-            client_id,
-            authority=f"https://login.microsoftonline.com/{tenant_id}",
-            client_credential=client_secret,
+            self.client_id,
+            authority=f"https://login.microsoftonline.com/{self.tenant_id}",
+            client_credential=self.client_secret,
         )
-        result = app.acquire_token_for_client(scopes=required_scopes)
+        result = app.acquire_token_for_client(scopes=self.required_scopes)
         if "access_token" not in result:
             self.logger.critical("Failed to acquire token")
             self.logger.error("Failed to acquire token")
@@ -67,8 +78,8 @@ class EntraClient:
         }
 
     def flush(self):
-        self.logger.info(f"FLUSHING CACHE in ({self.cache_dir})")
-        os.system(f"rm -f {self.cache_dir}/entra*")
+        self.logger.info(f"FLUSHING ENTRA CACHE in ({self.cache_dir})")
+        os.system(f"rm -rf {self.cache_dir}/entra*")
 
     def __mkdir_p__(self, path):
         os.makedirs(path, exist_ok=True)
@@ -142,6 +153,25 @@ class EntraClient:
             self.logger.info(f"ID: {scope['id']}, Value: {scope['value']}, Admin Consent: {scope['adminConsentDisplayName']}")
         return scopes
     
+    def __read_from_cache__(self, cache_file):
+        with open(cache_file, "r") as f:
+            data = json.load(f)
+            return data
+        
+    def __write_to_cache__(self, cache_file, data):
+        self.logger.debug(f"-e-e-e- Writing into disk cache: {cache_file}")
+        with open(cache_file, "w") as f:
+            json.dump(data, f)
+
+    def __load_json_file__(self, file_path):
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, IOError) as e:
+            self.logger.warning(f"Failed to load JSON from {file_path}: {e}")
+            data = {}
+        return data
+    
     ###########################################################################################
     #################################### USERS ################################################
     ###########################################################################################
@@ -171,9 +201,7 @@ class EntraClient:
             if self.users_cache_dir is not None:
                 email_file_name = f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='')}"            
                 if os.path.exists(email_file_name):
-                    with open(email_file_name, "r") as f:
-                        data = json.load(f)
-                        return data
+                    return self.client.__read_from_cache__(email_file_name)
                 email_failed_file_name = f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='')}.failed"
                 if os.path.exists(email_failed_file_name):
                     return None
@@ -185,14 +213,10 @@ class EntraClient:
             else:
                 self.client.logger.warning(f"{self.__class__.__name__}({email}) Failed to retrieve user info")
                 if self.users_cache_dir is not None:
-                    with open(email_failed_file_name, "w") as f:
-                        f.write("FAILED")
+                    self.client.__write_to_cache__(email_failed_file_name, "FAILED")
                 return None
-            
             if self.users_cache_dir is not None:
-                self.client.logger.debug(f"-e-e-e- Writing into disk cache: ({email})")
-                with open(email_file_name, "w") as f:
-                    json.dump(data, f)
+                self.client.__write_to_cache__(email_file_name, data)
             return data
 
         def get_oid(self, email):
@@ -215,6 +239,65 @@ class EntraClient:
                 self.get_oid(email)
             ## Note this will not return if the email does not exist in the cache
             return [self.cache.get(email) for email in user_emails if self.cache.get(email) is not None]
+        
+        def get_all(self, STOP_LIMIT=None):
+            count      = 0
+            users_list = []
+            my_limit   = 100000
+            if STOP_LIMIT is not None:
+                my_limit = STOP_LIMIT
+            if self.users_cache_dir is not None:
+                print(self.users_cache_dir)
+                json_files = glob.glob(os.path.join(self.users_cache_dir, "*"))
+                if (len(json_files) > 0):
+                    self.client.logger.debug(f"USING CACHED USERS: {len(json_files)}")
+                    for json_file in json_files:
+                        if count >= my_limit:
+                            break
+                        users_list.append(self.client.__load_json_file__(json_file))
+                    return users_list
+
+            ## TODO: implement stoplimit properly
+            next_uri = f"{self.client.graph_api_url}/v1.0/users"
+            while next_uri:
+                self.client.logger.debug(f"Getting users from {next_uri}")
+                response = requests.get(next_uri, headers=self.client.headers)
+                if response.status_code != 200:
+                    self.client.logger.warning(f"{self.__class__.__name__}() Failed to retrieve all users ({response.json()})")
+                    return None
+                data = response.json()
+                users_list.extend(data.get('value', []))
+                next_uri = data.get('@odata.nextLink')
+            for user in users_list:
+                if self.users_cache_dir is not None:
+                    self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(user['userPrincipalName'], safe='').lower()}", user)
+            return users_list
+        
+        def principal_name_lower_case(self, email):
+            # self.client.logger.debug(f"User ID: {email} --> {email.lower()}")
+            if email is None:
+                return None
+            
+            ## for this use case we need to call the graph API to get the user details and not pull from cache
+            next_uri = f"{self.client.graph_api_url}/v1.0/users/{email}"
+            data = { "userPrincipalName": email.lower() }
+            response = requests.patch(next_uri, headers=self.client.headers, json=data)
+            if response.status_code == 204:
+                self.client.logger.info(f"Updated userPrincipalName ({email}) --> ({email.lower()})")
+            else:
+                self.client.logger.warning(f"Failed to update userPrincipalName for user {email}: {response.status_code} - {response.text}")
+                return None
+
+            response = requests.get(next_uri, headers=self.client.headers)  
+            if response.status_code == 200:
+                data = response.json()
+            else:
+                self.client.logger.warning(f"{self.__class__.__name__}({email}) Failed to retrieve user info")
+                return None
+            
+            if self.users_cache_dir is not None:
+                self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='').lower()}", data)
+            return data
 
         def __str__(self):
             return f"{self.cache}"
@@ -253,9 +336,7 @@ class EntraClient:
             if self.apps_cache_dir is not None:
                 app_file_name = f"{self.apps_cache_dir}/{urllib.parse.quote(app, safe='')}"
                 if os.path.exists(app_file_name):
-                    with open(app_file_name, "r") as f:
-                        data = json.load(f)
-                        return data
+                    return self.client.__read_from_cache__(app_file_name)
 
             response = requests.get(next_uri, headers=self.client.headers)
             if response.status_code != 200:
@@ -270,9 +351,7 @@ class EntraClient:
             
             my_app = my_app_response[0]
             if self.apps_cache_dir is not None:
-                self.client.logger.debug(f"-a-a-a- Writing into disk cache: ({app})")
-                with open(app_file_name, "w") as f:
-                    json.dump(my_app, f)
+                self.client.__write_to_cache__(app_file_name, my_app)
             return my_app
         
         def get_id(self, app_name):
@@ -298,9 +377,7 @@ class EntraClient:
             if self.apps_cache_dir is not None:
                 sp_file_name = f"{self.sp_cache_dir}/{urllib.parse.quote(app_name, safe='')}"
                 if os.path.exists(sp_file_name):
-                    with open(sp_file_name, "r") as f:
-                        data = json.load(f)
-                        return data
+                    return self.client.__read_from_cache__(sp_file_name)
             response = requests.get(next_uri, headers=self.client.headers)
             if response.status_code != 200:
                 self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Failed to retrieve service principal information")
@@ -312,9 +389,7 @@ class EntraClient:
             service_principal_id = service_principal_info["value"][0]["id"]
             self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Service principal ID is {service_principal_id}")
             if self.apps_cache_dir is not None:
-                self.client.logger.debug(f"-a-a-a- Writing into disk cache: ({app_name})")
-                with open(sp_file_name, "w") as f:
-                    json.dump(service_principal_info["value"][0], f)
+                self.client.__write_to_cache__(sp_file_name, service_principal_info["value"][0])
             return service_principal_info["value"][0]
         
         def get_service_principal_id(self, app_name):
@@ -658,8 +733,11 @@ class EntraClient:
             self.client           = client
             self.cache            = {}
             self.groups_cache_dir = None
+            self.groups_members_cache_dir = None
             if (self.client.cache_dir is not None):
                 self.groups_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups')
+            if (self.client.cache_dir is not None):
+                self.groups_members_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups_members')
 
         def get_details(self, group):
             if group is None:
@@ -667,15 +745,13 @@ class EntraClient:
             if self.groups_cache_dir is not None:
                 group_file_name = f"{self.groups_cache_dir}/{urllib.parse.quote(group, safe='')}"
                 if os.path.exists(group_file_name):
-                    with open(group_file_name, "r") as f:
-                        data = json.load(f)
-                        return data
+                    return self.client.__read_from_cache__(group_file_name)
 
             encoded_group_name = urllib.parse.quote(group)
             next_uri = f"{self.client.graph_api_url}/v1.0/groups?$filter=displayName eq '{encoded_group_name}'"
             response = requests.get(next_uri, headers=self.client.headers)
             if response.status_code != 200:
-                self.client.logger.debug(f"{self.__class__.__name__} Failed to get group for '{group}': {response.text}")
+                self.client.logger.warning(f"{self.__class__.__name__} Failed to get group for '{group}': {response.status_code} / {response.text}")
                 return None
             
             # this is a query so it comes back in a value record
@@ -685,9 +761,7 @@ class EntraClient:
                 return None
 
             if self.groups_cache_dir is not None:
-                self.client.logger.debug(f"-e-e-e- Writing into disk cache: ({group})")
-                with open(group_file_name, "w") as f:
-                    json.dump(groups[0], f)
+                self.client.__write_to_cache__(group_file_name, groups[0])
             return groups[0]
 
         def get_id(self, group_name):
@@ -698,6 +772,10 @@ class EntraClient:
         
         def get_members(self, group_id):
             members = []
+            if self.groups_cache_dir is not None:
+                group_members_file_name = f"{self.groups_members_cache_dir}/{urllib.parse.quote(group_id, safe='')}"
+                if os.path.exists(group_members_file_name):
+                    return self.client.__read_from_cache__(group_members_file_name)
             next_uri = f"{self.client.graph_api_url}/v1.0/groups/{group_id}/members"
             while next_uri:
                 response = requests.get(next_uri, headers=self.client.headers)
@@ -708,6 +786,8 @@ class EntraClient:
                 else:
                     self.client.logger.warning(f"{self.__class__.__name__} Failed to get members for group '{group_id}': {response.text}")
                     return []
+            if self.groups_cache_dir is not None:
+                self.client.__write_to_cache__(group_members_file_name, members)
             return members
         
         def __add_users__(self, group_id, membership_list):
@@ -731,8 +811,9 @@ class EntraClient:
                 return total_added
             return 0
         
-        def add_users(self, group_id, user_oids):
-            current_members = self.get_members(group_id)
+        def add_users(self, group_id, user_oids, current_members=None):
+            if current_members is None:
+                current_members = self.get_members(group_id)
             membership_list = []
             for user_oid in user_oids:
                 if user_oid not in current_members:
