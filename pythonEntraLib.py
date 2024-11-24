@@ -172,6 +172,70 @@ class EntraClient:
             data = {}
         return data
     
+    def __get_details__(self, my_request, my_type, my_cache, my_key):
+        if my_request is None:
+            return None
+        
+        encoded_request = urllib.parse.quote(my_request)
+        if self.__is_valid_uuid__(my_request):
+            ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
+            # next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app}"
+            next_uri = f"{self.graph_api_url}/v1.0/{my_type}?$filter=id eq '{my_request}'"
+        else:
+            next_uri = f"{self.graph_api_url}/v1.0/{my_type}?$filter={my_key} eq '{encoded_request}'"
+
+        if my_cache is not None:
+            my_filename = f"{my_cache}/{urllib.parse.quote(my_request, safe='')}.json"
+            if os.path.exists(my_filename):
+                return self.__read_from_cache__(my_filename)
+
+        response = requests.get(next_uri, headers=self.headers)
+        if response.status_code != 200:
+            self.logger.debug(f"{self.__class__.__name__}({my_request}) Failed to retrieve {my_type}")
+            return None
+
+        my_response = response.json().get('value', [])
+        if len(my_response) == 0:
+            self.logger.debug(f"{self.__class__.__name__}({my_request}) not found")
+            return None
+        
+        my_item = my_response[0]
+        if my_cache is not None:
+            self.__write_to_cache__(my_filename, my_item)
+        return my_item
+    
+    def __get_all__(self, my_type, my_cache, my_key, STOP_LIMIT=None):
+        count      = 0
+        my_list    = []
+        my_limit   = 100000
+        if STOP_LIMIT is not None:
+            my_limit = STOP_LIMIT
+        if my_cache is not None:
+            json_files = glob.glob(os.path.join(my_cache, "*.json"))
+            if (len(json_files) > 0):
+                self.logger.debug(f"USING CACHED FILES: {len(json_files)}")
+                for json_file in json_files:
+                    if count >= my_limit:
+                        break
+                    my_list.append(self.__load_json_file__(json_file))
+                return my_list
+            
+        ## TODO: implement stoplimit properly
+        next_uri = f"{self.graph_api_url}/v1.0/{my_type}"
+        while next_uri:
+            self.logger.debug(f"Getting {my_type} from {next_uri}")
+            response = requests.get(next_uri, headers=self.headers)
+            if response.status_code != 200:
+                self.logger.warning(f"{self.__class__.__name__}() Failed to retrieve all {my_type} ({response.json()})")
+                return None
+            data = response.json()
+            my_list.extend(data.get('value', []))
+            next_uri = data.get('@odata.nextLink')
+        for item in my_list:
+            if my_cache is not None:
+                self.__write_to_cache__(f"{my_cache}/{urllib.parse.quote(item[my_key], safe='').lower()}.json", item)
+        return my_list
+    
     ###########################################################################################
     #################################### USERS ################################################
     ###########################################################################################
@@ -195,29 +259,7 @@ class EntraClient:
                     self.get_oid(email)
 
         def get_details(self, email):
-            if email is None:
-                return None
-            email = email.lower()
-            if self.users_cache_dir is not None:
-                email_file_name = f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='')}"            
-                if os.path.exists(email_file_name):
-                    return self.client.__read_from_cache__(email_file_name)
-                email_failed_file_name = f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='')}.failed"
-                if os.path.exists(email_failed_file_name):
-                    return None
-                    
-            next_uri = f"{self.client.graph_api_url}/v1.0/users/{email}"
-            response = requests.get(next_uri, headers=self.client.headers)  
-            if response.status_code == 200:
-                data = response.json()
-            else:
-                self.client.logger.warning(f"{self.__class__.__name__}({email}) Failed to retrieve user info")
-                if self.users_cache_dir is not None:
-                    self.client.__write_to_cache__(email_failed_file_name, "FAILED")
-                return None
-            if self.users_cache_dir is not None:
-                self.client.__write_to_cache__(email_file_name, data)
-            return data
+            return self.client.__get_details__(email, "users", self.users_cache_dir, "userPrincipalName")
 
         def get_oid(self, email):
             email = email.lower()
@@ -241,37 +283,7 @@ class EntraClient:
             return [self.cache.get(email) for email in user_emails if self.cache.get(email) is not None]
         
         def get_all(self, STOP_LIMIT=None):
-            count      = 0
-            users_list = []
-            my_limit   = 100000
-            if STOP_LIMIT is not None:
-                my_limit = STOP_LIMIT
-            if self.users_cache_dir is not None:
-                print(self.users_cache_dir)
-                json_files = glob.glob(os.path.join(self.users_cache_dir, "*"))
-                if (len(json_files) > 0):
-                    self.client.logger.debug(f"USING CACHED USERS: {len(json_files)}")
-                    for json_file in json_files:
-                        if count >= my_limit:
-                            break
-                        users_list.append(self.client.__load_json_file__(json_file))
-                    return users_list
-
-            ## TODO: implement stoplimit properly
-            next_uri = f"{self.client.graph_api_url}/v1.0/users"
-            while next_uri:
-                self.client.logger.debug(f"Getting users from {next_uri}")
-                response = requests.get(next_uri, headers=self.client.headers)
-                if response.status_code != 200:
-                    self.client.logger.warning(f"{self.__class__.__name__}() Failed to retrieve all users ({response.json()})")
-                    return None
-                data = response.json()
-                users_list.extend(data.get('value', []))
-                next_uri = data.get('@odata.nextLink')
-            for user in users_list:
-                if self.users_cache_dir is not None:
-                    self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(user['userPrincipalName'], safe='').lower()}", user)
-            return users_list
+            return self.client.__get_all__("users", self.users_cache_dir, 'userPrincipalName', STOP_LIMIT)
         
         def principal_name_lower_case(self, email):
             # self.client.logger.debug(f"User ID: {email} --> {email.lower()}")
@@ -296,7 +308,7 @@ class EntraClient:
                 return None
             
             if self.users_cache_dir is not None:
-                self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='').lower()}", data)
+                self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='').lower()}.json", data)
             return data
 
         def __str__(self):
@@ -322,37 +334,14 @@ class EntraClient:
                 self.sp_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
 
         def get_details(self, app):
-            if app is None:
-                return None
-            
-            encoded_app_name = urllib.parse.quote(app)
-            if self.client.__is_valid_uuid__(app):
-                ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
-                # next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app}"
-                next_uri = f"{self.client.graph_api_url}/v1.0/applications?$filter=id eq '{app}'"
-            else:
-                next_uri = f"{self.client.graph_api_url}/v1.0/applications?$filter=displayName eq '{encoded_app_name}'"
-
-            if self.apps_cache_dir is not None:
-                app_file_name = f"{self.apps_cache_dir}/{urllib.parse.quote(app, safe='')}"
-                if os.path.exists(app_file_name):
-                    return self.client.__read_from_cache__(app_file_name)
-
-            response = requests.get(next_uri, headers=self.client.headers)
-            if response.status_code != 200:
-                self.client.logger.debug(f"{self.__class__.__name__}({app}) Failed to retrieve application information")
-                return None
-
-            my_app_response = response.json().get('value', [])
-            if len(my_app_response) == 0:
-                self.client.logger.debug(f"{self.__class__.__name__}({app}) not found")
-                ## for apps we don't write failed
-                return None
-            
-            my_app = my_app_response[0]
-            if self.apps_cache_dir is not None:
-                self.client.__write_to_cache__(app_file_name, my_app)
-            return my_app
+            return self.client.__get_details__(app, "applications", self.apps_cache_dir, "displayName")
+        def get_service_principal_details(self, app):
+            return self.client.__get_details__(app, "servicePrincipals", self.sp_cache_dir, "displayName")
+        
+        def get_all(self, STOP_LIMIT=None):
+            return self.client.__get_all__("applications", self.apps_cache_dir, 'displayName', STOP_LIMIT)
+        def get_all_service_principals(self, STOP_LIMIT=None):
+            return self.client.__get_all__("servicePrincipals", self.sp_cache_dir, 'displayName', STOP_LIMIT)
         
         def get_id(self, app_name):
             app_info = self.get_details(app_name)
@@ -365,33 +354,7 @@ class EntraClient:
             if app_info is None:
                 return None
             return app_info.get("appId")
-            
-        def get_service_principal_details(self, app_name):
-            encoded_app_name = urllib.parse.quote(app_name)
-            if self.client.__is_valid_uuid__(app_name):
-                ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
-                # next_uri = f"{self.client.graph_api_url}/v1.0/applications/{app}"
-                next_uri = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=id eq '{app_name}'"
-            else:
-                next_uri = f"{self.client.graph_api_url}/v1.0/servicePrincipals?$filter=displayName eq '{encoded_app_name}'"
-            if self.apps_cache_dir is not None:
-                sp_file_name = f"{self.sp_cache_dir}/{urllib.parse.quote(app_name, safe='')}"
-                if os.path.exists(sp_file_name):
-                    return self.client.__read_from_cache__(sp_file_name)
-            response = requests.get(next_uri, headers=self.client.headers)
-            if response.status_code != 200:
-                self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Failed to retrieve service principal information")
-                return None
-            service_principal_info = response.json()
-            if not service_principal_info["value"]:
-                self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Service principal not found")
-                return None
-            service_principal_id = service_principal_info["value"][0]["id"]
-            self.client.logger.debug(f"{self.__class__.__name__}({app_name}) Service principal ID is {service_principal_id}")
-            if self.apps_cache_dir is not None:
-                self.client.__write_to_cache__(sp_file_name, service_principal_info["value"][0])
-            return service_principal_info["value"][0]
-        
+                
         def get_service_principal_id(self, app_name):
             sp_info = self.get_service_principal_details(app_name)
             if sp_info is None:
@@ -740,29 +703,10 @@ class EntraClient:
                 self.groups_members_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups_members')
 
         def get_details(self, group):
-            if group is None:
-                return None
-            if self.groups_cache_dir is not None:
-                group_file_name = f"{self.groups_cache_dir}/{urllib.parse.quote(group, safe='')}"
-                if os.path.exists(group_file_name):
-                    return self.client.__read_from_cache__(group_file_name)
-
-            encoded_group_name = urllib.parse.quote(group)
-            next_uri = f"{self.client.graph_api_url}/v1.0/groups?$filter=displayName eq '{encoded_group_name}'"
-            response = requests.get(next_uri, headers=self.client.headers)
-            if response.status_code != 200:
-                self.client.logger.warning(f"{self.__class__.__name__} Failed to get group for '{group}': {response.status_code} / {response.text}")
-                return None
-            
-            # this is a query so it comes back in a value record
-            groups = response.json().get('value', [])
-            if len(groups) == 0:
-                self.client.logger.debug(f"{self.__class__.__name__} Failed to get group for '{group}': {response.text}")
-                return None
-
-            if self.groups_cache_dir is not None:
-                self.client.__write_to_cache__(group_file_name, groups[0])
-            return groups[0]
+            return self.client.__get_details__(group, "groups", self.groups_cache_dir, "displayName")
+        
+        def get_all(self, STOP_LIMIT=None):
+            return self.client.__get_all__("groups", self.groups_cache_dir, 'displayName', STOP_LIMIT)
 
         def get_id(self, group_name):
             group = self.get_details(group_name)
@@ -770,12 +714,18 @@ class EntraClient:
                 return group['id']
             return None
         
-        def get_members(self, group_id):
+        def get_members(self, group):
+            if group is None:
+                return None
+            if self.client.__is_valid_uuid__(group):
+                group_id = group
+            else:
+                group_id = self.get_id(group)
             members = []
             if self.groups_cache_dir is not None:
-                group_members_file_name = f"{self.groups_members_cache_dir}/{urllib.parse.quote(group_id, safe='')}"
-                if os.path.exists(group_members_file_name):
-                    return self.client.__read_from_cache__(group_members_file_name)
+                group_members_filename = f"{self.groups_members_cache_dir}/{urllib.parse.quote(group_id, safe='')}.json"
+                if os.path.exists(group_members_filename):
+                    return self.client.__read_from_cache__(group_members_filename)
             next_uri = f"{self.client.graph_api_url}/v1.0/groups/{group_id}/members"
             while next_uri:
                 response = requests.get(next_uri, headers=self.client.headers)
@@ -787,7 +737,7 @@ class EntraClient:
                     self.client.logger.warning(f"{self.__class__.__name__} Failed to get members for group '{group_id}': {response.text}")
                     return []
             if self.groups_cache_dir is not None:
-                self.client.__write_to_cache__(group_members_file_name, members)
+                self.client.__write_to_cache__(group_members_filename, members)
             return members
         
         def __add_users__(self, group_id, membership_list):

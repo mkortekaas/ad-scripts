@@ -31,6 +31,7 @@ import sys
 import math
 import glob
 import re
+import gzip
 
 ###################################################################################
 class OktaInfo:
@@ -75,6 +76,8 @@ class OktaInfo:
         self.dir_groups              = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_groups")
         self.dir_groups_users        = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_groups_users")
         self.dir_users               = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_users")
+        self.dir_users_apps          = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_users_apps")
+        self.dir_syslogs             = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_syslogs")
 
     def __mkdir_p__(self, path):
         if path is not None:
@@ -97,7 +100,7 @@ class OktaInfo:
         self.api_call_timestamps[self.last_api_index].append(current_time)  # Append current timestamp here
         while len(self.api_call_timestamps[self.last_api_index]) >= self.GLOBAL_RATE_LIMIT:
             current_time = datetime.now()
-            self.logger.debug(f"RATE_LIMIT_PAUSE: {len(self.api_call_timestamps[self.last_api_index])} / {self.GLOBAL_RATE_LIMIT} / {self.last_api_index} in last minute : {current_time}")
+            self.logger.debug(f"RATE_LIMIT_PAUSE: {len(self.api_call_timestamps[self.last_api_index])} / {self.GLOBAL_RATE_LIMIT} / {self.last_api_index} in last minute")
             while self.api_call_timestamps[self.last_api_index] and self.api_call_timestamps[self.last_api_index][self.last_api_index] < current_time - timedelta(seconds=60):
                 self.api_call_timestamps[self.last_api_index].popleft()  # Remove timestamps older than 1 minute
             time.sleep(2)
@@ -109,10 +112,13 @@ class OktaInfo:
         }
         return headers
     
+    def get_headers(self):
+        return self.__get_headers__()
+    
     def __https_get__(self, url):
         response = requests.get(url, headers=self.__get_headers__())
         if response.status_code != 200:
-            self.logger.error(f"Failed to retrieve {url}\tStatus code: {response.status_code}")
+            self.logger.error(f"Failed to retrieve {url}\tStatus code: {response.status_code} ({response.text})")
             return None
         return response
 
@@ -126,6 +132,8 @@ class OktaInfo:
                     json_info = json.load(f)
                     return json_info
         response = self.__https_get__(url)
+        if response is None:
+            return None
         self.logger.debug(f"+o+o+o+ Writing into disk cache: {file_path} ({url})")
         with open(file_path, 'w') as f:
             json.dump(response.json(), f)
@@ -139,8 +147,8 @@ class OktaInfo:
     def __get_user_id_by_email__(self, email):
         url = f'https://{self.OKTA_DOMAIN}/api/v1/users?q={email}'
         response = self.__https_get__(url)
-        users = response.json()
-        if users:
+        if response:
+            users = response.json()
             return users[0]['id']
         return None
 
@@ -161,6 +169,41 @@ class OktaInfo:
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'clients', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'appLinks', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'grants', json_user_data['id'])
+   
+    def get_logs(self, id, days_back=15):
+        filename = f"{self.dir_syslogs}/{id}.json.gz"
+        if os.path.exists(filename):
+            with gzip.open(filename, "rt") as f:
+                log = json.load(f)
+                return log
+        now = datetime.now()
+        start_date = now - timedelta(days=days_back)
+        period = timedelta(days=15)
+        all_logs = []
+        while start_date < now:
+            end_date = start_date + period
+            if end_date > now:
+                end_date = now
+            iso8601_start = start_date.isoformat()
+            iso8601_end   = end_date.isoformat()
+            query = {
+                "filter": f"actor.id eq \"{id}\"",
+                "sortOrder": "DESCENDING",
+                "since": iso8601_start,
+                "until": iso8601_end,
+                "limit": 1000
+            }
+            url = f'https://{self.OKTA_DOMAIN}/api/v1/logs'
+            response = requests.get(url, headers=self.__get_headers__(), params=query)
+            if response.status_code != 200:
+                self.logger.warning(f"Failed to retrieve logs for {id}. Status {response.status_code} / {response.text}")
+                return None
+            logs = response.json()
+            all_logs.extend(logs)
+            start_date = end_date
+        with gzip.open(filename, "wt") as f:
+            f.write(json.dumps(all_logs))
+        return all_logs
 
     def users_fetch_all(self, STOP_LIMIT=None):
         count     = 0
@@ -206,27 +249,106 @@ class OktaInfo:
         ## this is a special case where we are changing the login name to lower case
         ## we need to refetch from the API and then change and then a PUT
         self.logger.debug(f"Getting user: {id}")        
-        url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
-        response = self.__https_get__(url)
+        # url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
+        # response = self.__https_get__(url)
+        response = self.user(id)
         if response:
-            user = response.json()
-            user['profile']['login'] = user['profile']['login'].lower()
+            # user = response.json()
+            user = response
             query = { "strict": "true" }
-            payload = {
-                "profile": {
-                    "login": user['profile']['login'].lower()
+            payload = { "profile": {} }
+            before = { "profile": {} }
+
+            LOGIN=False
+            if 'profile' in user and 'login' in user['profile']:
+                if any(char.isupper() for char in user['profile']['login']):
+                    before["profile"]["login"]               = user['profile']['login']
+                    payload["profile"]["login"]              = user['profile']['login'].lower()
+                    user['profile']['login']                 = user['profile']['login'].lower()
+                    LOGIN=True
+                    
+            EMAIL=False
+            if 'profile' in user and 'email' in user['profile']:
+                if any(char.isupper() for char in user['profile']['email']):
+                    before["profile"]["email"]               = user['profile']['email']
+                    payload["profile"]["email"]              = user['profile']['email'].lower()
+                    user['profile']['email']                 = user['profile']['email'].lower()
+                    EMAIL=True
+
+            EMP=False
+            if 'profile' in user and 'employeeNumber' in user['profile']:
+                if len(user['profile']['employeeNumber']) > 0:
+                    if any(char.isupper() for char in user['profile']['employeeNumber']):
+                        before["profile"]["employeeNumber"]  = user['profile']['employeeNumber']
+                        payload["profile"]["employeeNumber"] = user['profile']['employeeNumber'].lower()
+                        user['profile']['employeeNumber']    = user['profile']['employeeNumber'].lower()
+                        EMP=True
+
+            PROXY=False
+            if 'profile' in user and 'proxyaddresses' in user['profile']:
+                if len(user['profile']['proxyaddresses']) > 0:
+                    before["profile"]["proxyaddresses"]      = user['profile']['proxyaddresses']
+                    new_proxyaddresses = []
+                    for proxyaddress in user['profile']['proxyaddresses']:
+                        if not ":" in proxyaddress:
+                            new_proxyaddresses.append(proxyaddress)
+                        else:
+                            smtp  = proxyaddress.split(":")[0]
+                            email = proxyaddress.split(":")[1]
+                            if any(char.isupper() for char in email):
+                                new_email = email.lower()
+                                proxyaddress = f"{smtp}:{new_email}"
+                                new_proxyaddresses.append(proxyaddress)
+                            else:
+                                new_proxyaddresses.append(proxyaddress)
+                    payload["profile"]["proxyaddresses"]     = new_proxyaddresses
+                    user['profile']['proxyaddresses']        = new_proxyaddresses
+                    PROXY=True
+
+            if LOGIN and EMAIL and EMP and PROXY:
+                combined_dict = {
+                    "query": query,
+                    "before": before,
+                    "payload": payload
                 }
-            }
-            response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
-            if response.status_code != 200:
-                self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
-                return None
-            
+                print(json.dumps(combined_dict, indent=4))
+                print("=-"*40)
+            # response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
+            # if response.status_code != 200:
+            #     self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
+            #     return None
+
+            return None
+                       
             ## clear cache file && re-write so in local cache as updated
             file_path = f"{self.dir_users}/{id}.json"
             with open(file_path, 'w') as f:
                 json.dump(response.json(), f)
             return response.json()
+        
+    def user_set_password(self, id, password):
+        ## MIGHT want to instead use this endpoint: https://developer.okta.com/docs/reference/api/authn/#reset-password
+        ##    which (should?) force a password reset on next time they login
+        self.logger.debug(f"setting user: {id}")        
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
+        query = { "strict": "false" }
+        payload = { 
+            "credentials": {
+                "password": 
+                    { "value": password }
+            } 
+        }
+        response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
+        if response.status_code != 200:
+            self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
+            return False
+        return True
+                    
+    def user_get_apps(self, id):
+        ## this returns "official" apps assigned to the user - not private on-the-fly ones
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}/appLinks'
+        response = self.__https_get__(url)
+        return response.json()
 
     def groups(self, id):
         if id in self.cache_groups:
@@ -246,13 +368,23 @@ class OktaInfo:
         self.cache_groups_users[id] = group_users
         return group_users
     
-    def app(self, id, force=False):
+    def app(self, id, user_id=None, force=False):
         ### TODO - verify if other files start with the file in question....
         ###    if files were moved they will get called again and written 2nd version
+
+        ## the logic on saving these under the user_id is if it is an on-the-fly private app
+        ##    which are not able to be found except by walking the system log for each user
+        ##    if you walk the logs and you have a target[0] record in the log
+        ##    - and that has a displayName of "On The Fly App" then you can get the id
+        ##    - then you can grab the app info from the api 
         if force is False and id in self.cache_apps:
             return self.cache_apps[id]
         url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}' ## GET
-        file_path = f"{self.dir_app_info}/{id}.json"
+        if user_id is not None:
+            self.__mkdir_p__(f"{self.dir_users_apps}/{user_id}")
+            file_path = f"{self.dir_users_apps}/{user_id}/{id}.json"
+        else:
+            file_path = f"{self.dir_app_info}/{id}.json"
         app_info = self.__fetch_to_cache__(url, file_path, force)
         self.cache_apps[id] = app_info
         return app_info
