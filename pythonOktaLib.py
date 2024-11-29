@@ -113,31 +113,45 @@ class OktaInfo:
         return headers
     
     def get_headers(self):
+        ## this is just if you want to call the api from outside this class directly you can use the header
         return self.__get_headers__()
-    
-    def __https_get__(self, url):
-        response = requests.get(url, headers=self.__get_headers__())
-        if response.status_code != 200:
-            self.logger.error(f"Failed to retrieve {url}\tStatus code: {response.status_code} ({response.text})")
-            return None
-        return response
-
-    def __fetch_to_cache__(self, url, file_path, force=False):
-        if os.path.exists(file_path):
-            if force is True:
-                os.remove(file_path)  ## this will force a refresh
+       
+    def __https_get__(self, url, params=None):
+        while True:
+            if params is None:
+                response = requests.get(url, headers=self.__get_headers__())
             else:
-                # self.logger.debug(f"-o-o-o- Reading from disk cache: {file_path}")
-                with open(file_path, 'r') as f:
+                response = requests.get(url, headers=self.__get_headers__(), params=params)
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:
+                ## in theory we take care of this with the __get_headers__ function but have found not always perfect
+                reset_time = int(response.headers.get('X-Rate-Limit-Reset', time.time() + 60))
+                wait_time = reset_time - int(time.time())
+                self.logger.warning(f"RATE_LIMIT_EXCEEDED - Waiting for {wait_time} seconds before retrying.")
+                time.sleep(wait_time)
+            else:
+                self.logger.error(f"Failed to retrieve {url}\tStatus code: {response.status_code} ({response.text})")
+                return None
+
+    def __fetch_to_cache__(self, url, filename, force=False):
+        if os.path.exists(filename):
+            if force is True:
+                os.remove(filename)  ## this will force a refresh
+            else:
+                # self.logger.debug(f"-o-o-o- Reading from disk cache: {filename}")
+                with open(filename, 'r') as f:
                     json_info = json.load(f)
                     return json_info
         response = self.__https_get__(url)
         if response is None:
-            return None
-        self.logger.debug(f"+o+o+o+ Writing into disk cache: {file_path} ({url})")
-        with open(file_path, 'w') as f:
-            json.dump(response.json(), f)
-        return response.json()
+            my_json = { "status": "NOT_FOUND" }
+        else: 
+            my_json = response.json()
+        self.logger.debug(f"+o+o+o+ Writing into disk cache: {filename} ({url})")
+        with open(filename, 'w') as f:
+            json.dump(my_json, f)
+        return my_json
         
     def __is_email_address__(self, id):
         # Define a regex pattern for validating email addresses
@@ -149,7 +163,8 @@ class OktaInfo:
         response = self.__https_get__(url)
         if response:
             users = response.json()
-            return users[0]['id']
+            if len(users) > 0 and 'id' in users[0]:
+                return users[0]['id']
         return None
 
     def user(self, id):
@@ -161,14 +176,22 @@ class OktaInfo:
         if id in self.cache_user:
             return self.cache_user[id]
         url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
-        file_path = f"{self.dir_users}/{id}.json"
-        user_info = self.__fetch_to_cache__(url, file_path)
+        filename = f"{self.dir_users}/{id}.json"
+        user_info = self.__fetch_to_cache__(url, filename)
         self.cache_user[id] = user_info
         return user_info
     # now that we have the id - we can get the apps for this user - for reference
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'clients', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'appLinks', json_user_data['id'])
     #   oktaUserGetData(OKTA_DOMAIN, OKTA_TOKEN, 'grants', json_user_data['id'])
+
+    def user_add_to_group(self, user_id, group_id):
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/groups/{group_id}/users/{user_id}'
+        response = requests.put(url, headers=self.__get_headers__())
+        if response.status_code != 204:
+            self.logger.warning(f"Failed to add user to group: {url} - response: {response.status_code} / {response.text}")
+            return False
+        return True
    
     def get_logs(self, id, days_back=15):
         filename = f"{self.dir_syslogs}/{id}.json.gz"
@@ -194,9 +217,8 @@ class OktaInfo:
                 "limit": 1000
             }
             url = f'https://{self.OKTA_DOMAIN}/api/v1/logs'
-            response = requests.get(url, headers=self.__get_headers__(), params=query)
-            if response.status_code != 200:
-                self.logger.warning(f"Failed to retrieve logs for {id}. Status {response.status_code} / {response.text}")
+            response = self.__hash__get__(url, query)   
+            if response is None:
                 return None
             logs = response.json()
             all_logs.extend(logs)
@@ -205,45 +227,49 @@ class OktaInfo:
             f.write(json.dumps(all_logs))
         return all_logs
 
-    def users_fetch_all(self, STOP_LIMIT=None):
+    def __fetch_all__(self, my_function, my_cache, my_cache_dir, STOP_LIMIT):
         count     = 0
-        users_list = []
+        my_list = []
         my_limit  = self.total_apps_to_fetch
         if STOP_LIMIT is not None:
             my_limit = STOP_LIMIT
-        json_files = glob.glob(os.path.join(self.dir_users, '*.json'))
+        json_files = glob.glob(os.path.join(my_cache_dir, '*.json'))
         if (len(json_files) > 0):
-            self.logger.debug(f"USING CACHED USERS: {len(json_files)}")
+            self.logger.debug(f"USING CACHED {my_function}: {len(json_files)}")
             for json_file in json_files:
                 if count >= my_limit:
                     break
                 with open(json_file, 'r') as f:
                     data = json.load(f)
-                    users_list.append(data)
+                    my_list.append(data)
+                    my_cache[data.get('id')] = data
                     count += 1
         else:
-            url = f'https://{self.OKTA_DOMAIN}/api/v1/users?limit={my_limit}'
+            url = f'https://{self.OKTA_DOMAIN}/api/v1/{my_function}?limit={my_limit}'
             while True:
                 if count >= STOP_LIMIT:
                     break
-                self.logger.info(f"========== Fetching USERS: {url} ==========")
+                self.logger.info(f"========== Fetching {my_function}: {url} ==========")
                 response = self.__https_get__(url)
-                users = response.json()
-                users_list.extend(users)
-                for user in users:
-                    file_name = f"{self.dir_users}/{user.get('id')}.json"
-                    self.cache_user[user.get('id')] = user
-                    with open(file_name, 'w') as f:
-                        json.dump(user, f)
+                items = response.json()
+                my_list.extend(items)
+                for item in items:
+                    filename = f"{my_cache_dir}/{item.get('id')}.json"
+                    my_cache[item.get('id')] = item
+                    with open(filename, 'w') as f:
+                        json.dump(item, f)
 
+                count += len(items)
                 if 'next' in response.links:
                     self.logger.debug(f"                          {response.links['next']} ")
                     url = response.links['next']['url']
-                    count += len(users)
                 else:
-                    count += len(users)
                     break
-        return users_list
+        return my_list
+    
+    def users_fetch_all(self, STOP_LIMIT=None):
+        return self.__fetch_all__("users", self.cache_user, self.dir_users, STOP_LIMIT)
+
     
     def user_login_lower_case(self, id):
         ## this is a special case where we are changing the login name to lower case
@@ -321,8 +347,8 @@ class OktaInfo:
             return None
                        
             ## clear cache file && re-write so in local cache as updated
-            file_path = f"{self.dir_users}/{id}.json"
-            with open(file_path, 'w') as f:
+            filename = f"{self.dir_users}/{id}.json"
+            with open(filename, 'w') as f:
                 json.dump(response.json(), f)
             return response.json()
         
@@ -354,19 +380,67 @@ class OktaInfo:
         if id in self.cache_groups:
             return self.cache_groups[id]
         url = f'https://{self.OKTA_DOMAIN}/api/v1/groups/{id}'
-        file_path = f"{self.dir_groups}/{id}.json"
-        group_info = self.__fetch_to_cache__(url, file_path)
+        filename = f"{self.dir_groups}/{id}.json"
+        group_info = self.__fetch_to_cache__(url, filename)
         self.cache_groups[id] = group_info
         return group_info
+       
+    def group_id_by_name(self, name):
+        # Check the cache first
+        for group_id, group_info in self.cache_groups.items():
+            if group_info.get('profile').get('name') == name:
+                return group_id
+    
+        # If not found in cache, call the Okta API
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/groups?q={name}'
+        response = self.__https_get__(url)
+        if response:
+            groups = response.json()
+            for group in groups:
+                if group.get('profile').get('name') == name:
+                    self.cache_groups[group['id']] = group
+                    return group['id']
+        else:
+            self.logger.warning(f"Failed to retrieve group by name: {name}. Status {response.status_code} / {response.text}")
+        return None
+    
+    def groups_fetch_all(self, STOP_LIMIT=None):
+        return self.__fetch_all__("groups", self.cache_groups, self.dir_groups, STOP_LIMIT)
 
     def groups_users(self, id):
         if id in self.cache_groups_users:
             return self.cache_groups_users[id]
+        
+        filename = f"{self.dir_groups_users}/{id}.json"
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                group_users = json.load(f)
+                self.cache_groups_users[id] = group_users
+                return group_users     
+        
+        group_users = []
         url = f'https://{self.OKTA_DOMAIN}/api/v1/groups/{id}/users'
-        file_path = f"{self.dir_groups_users}/{id}.json"
-        group_users = self.__fetch_to_cache__(url, file_path)
+        while True:
+            self.logger.debug(f"Fetching group_users from {url}")
+            response = self.__https_get__(url)
+            items = response.json()
+            group_users.extend(items)
+            if 'next' in response.links:
+                url = response.links['next']['url']
+            else:
+                break
+
+        with open(filename, 'w') as f:
+            json.dump(group_users, f)
         self.cache_groups_users[id] = group_users
         return group_users
+    
+    def groups_users_fetch_all(self, STOP_LIMIT=None):
+        count = 0
+        for group_id in self.cache_groups:
+            self.logger.info(f"Fetching group_users for: {group_id} {count}/{len(self.cache_groups)}")
+            self.groups_users(group_id)
+            count += 1
     
     def app(self, id, user_id=None, force=False):
         ### TODO - verify if other files start with the file in question....
@@ -382,10 +456,10 @@ class OktaInfo:
         url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}' ## GET
         if user_id is not None:
             self.__mkdir_p__(f"{self.dir_users_apps}/{user_id}")
-            file_path = f"{self.dir_users_apps}/{user_id}/{id}.json"
+            filename = f"{self.dir_users_apps}/{user_id}/{id}.json"
         else:
-            file_path = f"{self.dir_app_info}/{id}.json"
-        app_info = self.__fetch_to_cache__(url, file_path, force)
+            filename = f"{self.dir_app_info}/{id}.json"
+        app_info = self.__fetch_to_cache__(url, filename, force)
         self.cache_apps[id] = app_info
         return app_info
 
@@ -406,11 +480,9 @@ class OktaInfo:
         headers = self.__get_headers__()
         
         # Get the current app settings
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            self.logger.warning(f"Failed to retrieve app settings: {url} - response: {response}")
+        response = self.__https_get__(url)
+        if response is None:
             return False
-        
         app_settings = response.json()
         
         # Update the credentials object to allow password reveal
@@ -427,52 +499,14 @@ class OktaInfo:
         return True
 
     def apps_fetch(self, STOP_LIMIT=None):
-        count     = 0
-        apps_list = []
-        my_limit  = self.total_apps_to_fetch
-        if STOP_LIMIT is not None:
-            my_limit = STOP_LIMIT
-        json_files = glob.glob(os.path.join(self.dir_app_info, '*.json'))
-        if (len(json_files) > 0):
-            for json_file in json_files:
-                if count >= my_limit:
-                    break
-                with open(json_file, 'r') as f:
-                    # self.logger.debug(f"appFetch reading: {json_file}")
-                    data = json.load(f)
-                    apps_list.append(data)
-                    count += 1
-
-        else: 
-            url = f'https://{self.OKTA_DOMAIN}/api/v1/apps?limit={my_limit}'
-            while True:
-                if count >= STOP_LIMIT:
-                    break
-                self.logger.info(f"========== Fetching APPS: {url} ==========")
-                response = self.__https_get__(url)
-                apps = response.json()
-                apps_list.extend(apps)
-                for app in apps:
-                    file_name = f"{self.dir_app_info}/{app.get('id')}.json"
-                    self.cache_apps[app.get('id')] = app
-                    with open(file_name, 'w') as f:
-                        json.dump(app, f)
-
-                if 'next' in response.links:
-                    self.logger.debug(f"                          {response.links['next']} ")
-                    url = response.links['next']['url']
-                    count += len(apps)
-                else:
-                    count += len(apps)
-                    break  # No more pages
-        return apps_list
+        return self.__fetch_all__("apps", self.cache_apps, self.dir_app_info, STOP_LIMIT)
 
     # Function to get users for a given app ID
     def app_get_users(self, id):
         users     = []
-        file_name = f"{self.dir_app_users}/{id}.json"
-        if os.path.exists(file_name):
-            with open(file_name, 'r') as f:
+        filename = f"{self.dir_app_users}/{id}.json.gz"
+        if os.path.exists(filename):
+            with gzip.open(filename, 'rt') as f:
                 users = json.load(f)
         else:
             url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/users?limit={self.LIMIT_USERS}'       
@@ -492,15 +526,15 @@ class OktaInfo:
                 else:
                     self.logger.warning(f"Failed to retrieve users for app {id}. Status code: {response.status_code}")
                     break
-            with open(file_name, 'w') as f:
+            with gzip.open(filename, 'wt') as f:
                 json.dump(users, f)
         return users
 
     def app_get_groups(self, id):
         groups    = []
-        file_name = f"{self.dir_app_groups}/{id}.json"
-        if os.path.exists(file_name):
-            with open(file_name, 'r') as f:
+        filename = f"{self.dir_app_groups}/{id}.json"
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
                 groups = json.load(f)
         else:
             url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/groups?limit={self.LIMIT_GROUPS}'
@@ -521,7 +555,7 @@ class OktaInfo:
                     self.logger.warning(f"Failed to retrieve groups for app {id}. Status code: {response.status_code}")
                     url = None
                     break
-            with open(file_name, 'w') as f:
+            with open(filename, 'w') as f:
                 json.dump(groups, f)
         return groups
 
@@ -539,11 +573,11 @@ class OktaInfo:
         return ret_groups
     
     def app_cache_rename(self, id, new_extension):
-        file_name = f"{self.dir_app_info}/{id}.json"
-        if os.path.exists(file_name):
-            new_file_name = f"{file_name}_{new_extension}"
-            os.rename(file_name, new_file_name)
-            self.logger.info(f"renamed {file_name} {new_file_name}")
+        filename = f"{self.dir_app_info}/{id}.json"
+        if os.path.exists(filename):
+            new_filename = f"{filename}_{new_extension}"
+            os.rename(filename, new_filename)
+            self.logger.info(f"renamed {filename} {new_filename}")
 
 ########################################################################################
 class AppTracker:
@@ -556,6 +590,10 @@ class AppTracker:
         if apptracker_bearer is None:
             raise ValueError("apptracker_bearer is a required parameter")
         self.apptracker_bearer = apptracker_bearer
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {apptracker_bearer}"
+        }
 
     def __sanitize_json__(self, data):
         if isinstance(data, dict):
@@ -573,10 +611,7 @@ class AppTracker:
         okta_info = kwargs.get('okta_info', None)
         sso_info = kwargs.get('sso_info', None)
         tenant_id = kwargs.get('tenant_id', None)
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.apptracker_bearer}"
-        }
+
         json_data = { "okta_id": okta_id }
         if entra_app_info: json_data["entra_app_info"] = entra_app_info
         if entra_sp_info: json_data["entra_sp_info"] = entra_sp_info
@@ -585,19 +620,15 @@ class AppTracker:
         if tenant_id: json_data["tenant_id"] = tenant_id
         
         self.logger.debug(f"oktaAppTracker({okta_id}) Sending data to apptracker")
-        response = requests.post(f"{self.apptracker_url}/v1/ingestMessage/{okta_id}", headers=headers, json=json_data)
+        response = requests.post(f"{self.apptracker_url}/v1/ingestMessage/{okta_id}", headers=self.headers, json=json_data)
         if response.status_code != 200:
             self.logger.error(f"oktaAppTracker({okta_id}) FAILURE_APP_TRACKER: {response.text}")
             return False
         return True
 
     def set_sso_info(self, okta_id, key, value):
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.apptracker_bearer}"
-        }
         url = f"{self.apptracker_url}/v1/fetch/{okta_id}/sso_info"
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=self.headers)
         if response.status_code != 200:
             self.logger.warning(f"set_sso_info({okta_id}) FAILURE_APP_TRACKER: {response.text}")
             return False
@@ -609,11 +640,8 @@ class AppTracker:
         return self.write(okta_id, sso_info=sso_info)
 
     def delete(self, okta_id):
-        headers = {
-            "Authorization": f"Bearer {self.apptracker_bearer}"
-        }
         url = f"{self.apptracker_url}/v1/deleteMessage/{okta_id}"
-        response = requests.delete(url, headers=headers)
+        response = requests.delete(url, headers=self.headers)
         if response.status_code != 200:
             self.logger.warning(f"delete({okta_id}) FAILURE_APP_TRACKER: {response.text}")
             return False
@@ -626,11 +654,7 @@ class AppTracker:
                 apptracker_json_info = json.load(f)
         else:
             url = f"{self.apptracker_url}/v1/fetchAll"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.apptracker_bearer}",
-            }
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=self.headers)
             if response.status_code != 200:
                 self.logger.error(f"Failed to fetch app info from apptracker for all records")
                 exit(1)
@@ -639,9 +663,9 @@ class AppTracker:
                 json.dump(apptracker_json_info, output_file)
         return apptracker_json_info
   
-    def __check_file_newer_than__(self, file_path, hours):
-        if os.path.exists(file_path):
-            file_mod_time = os.path.getmtime(file_path)
+    def __check_file_newer_than__(self, filename, hours):
+        if os.path.exists(filename):
+            file_mod_time = os.path.getmtime(filename)
             current_time = time.time()
             one_hour_ago = current_time - (hours * 60 * 60)  # 3600 seconds in an hour
             return file_mod_time > one_hour_ago
