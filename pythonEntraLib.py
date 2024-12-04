@@ -235,7 +235,7 @@ class EntraClient:
         if my_cache_dir is not None:
             json_files = glob.glob(os.path.join(my_cache_dir, "*.json"))
             if (len(json_files) > 0):
-                self.logger.debug(f"USING CACHED FILES: {len(json_files)}")
+                self.logger.debug(f"USING CACHED FILES ({my_type}): {len(json_files)}")
                 for json_file in json_files:
                     if count >= my_limit:
                         break
@@ -326,7 +326,7 @@ class EntraClient:
 
             # we get the extra data for the user(s) given the way we call the graph API -- see above query/params
             if 'accountEnabled' in user_data and user_data['accountEnabled'] is False:
-                self.client.logger.info(f"Skipping disabled user {id} / {user_data['userPrincipalName']}")
+                # self.client.logger.info(f"Skipping disabled user {id} / {user_data['userPrincipalName']}")
                 return False
 
             data_before = {}
@@ -855,7 +855,8 @@ class EntraClient:
                 else:
                     self.client.logger.warning(f"{self.__class__.__name__}.{self.client.__caller_info__()}() Failed to get members for group '{group_id}': {response.text}")
                     return []
-            self.client.__write_to_cache__(group_members_filename, members)
+            if self.groups_cache_dir is not None:
+                self.client.__write_to_cache__(group_members_filename, members)
             return members
         
         def __add_users__(self, group_id, membership_list):
@@ -892,7 +893,7 @@ class EntraClient:
                 return self.__add_users__(group_id, membership_list)
             else:
                 self.client.logger.debug(f"{self.__class__.__name__}.{self.client.__caller_info__()}({group_id}) No new users to add to group")
-            return True
+            return 0
         
         def remove_users(self, group_id, user_oids):
             ## this works differently than the add - you can only remove one at a time
