@@ -155,12 +155,20 @@ class EntraClient:
             self.logger.info(f"ID: {scope['id']}, Value: {scope['value']}, Admin Consent: {scope['adminConsentDisplayName']}")
         return scopes
     
+    def http_get(self, url):
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200:
+            return response.json()
+        self.logger.warning(f"HTTP GET failed: {response.status_code}")
+        return None
+    
     def __read_from_cache__(self, cache_file):
         with open(cache_file, "r") as f:
             data = json.load(f)
             return data
         
     def __write_to_cache__(self, cache_file, data):
+        if self.cache_dir is None: return
         self.logger.debug(f"-e-e-e- Writing into disk cache: {cache_file}")
         with open(cache_file, "w") as f:
             json.dump(data, f)
@@ -174,24 +182,33 @@ class EntraClient:
             data = {}
         return data
     
-    def __get_details__(self, my_request, my_type, my_cache, my_key):
-        if my_request is None:
-            return None
+    def __get_details__(self, my_request, my_type, my_cache, my_cache_dir, my_key, FORCE_NEW=False):
+        if my_request is None: return None
+
+        # is it in memory already?
+        if not FORCE_NEW and my_request in my_cache:
+            return my_cache[my_request]
         
-        encoded_request = urllib.parse.quote(my_request)
+        if my_cache_dir is not None and self.__is_valid_uuid__(my_request):
+            my_filename = f"{my_cache_dir}/{urllib.parse.quote(my_request, safe='')}.json"
+            if not FORCE_NEW:
+                if os.path.exists(my_filename):
+                    data = self.__read_from_cache__(my_filename)
+                    my_cache[data['id']]   = data
+                    my_cache[data[my_key]] = data
+                    return data
+
+        next_uri = f"{self.graph_api_url}/v1.0/{my_type}"
         if self.__is_valid_uuid__(my_request):
             ## if we call it using the ID then the search for app name will not match format wise - thus do both as filter search
-            # next_uri = f"{self.graph_api_url}/v1.0/applications/{app}"
-            next_uri = f"{self.graph_api_url}/v1.0/{my_type}?$filter=id eq '{my_request}'"
+            query = { "$filter": f"id eq '{my_request}'" }            
         else:
-            next_uri = f"{self.graph_api_url}/v1.0/{my_type}?$filter={my_key} eq '{encoded_request}'"
+            query = { "$filter": f"{my_key} eq '{my_request}'" }
 
-        if my_cache is not None:
-            my_filename = f"{my_cache}/{urllib.parse.quote(my_request, safe='')}.json"
-            if os.path.exists(my_filename):
-                return self.__read_from_cache__(my_filename)
-
-        response = requests.get(next_uri, headers=self.headers)
+        if my_type == "users":
+            query["$select"] = 'businessPhones,displayName,givenName,jobTitle,mail,mobilePhone,officeLocation,preferredLanguage,surname,userPrincipalName,id,proxyAddresses,mailNickname,accountEnabled'
+            
+        response = requests.get(next_uri, headers=self.headers, params=query)
         if response.status_code != 200:
             self.logger.debug(f"{self.__class__.__name__}.{self.__caller_info__()}({my_request}) Failed to retrieve {my_type}")
             return None
@@ -202,40 +219,53 @@ class EntraClient:
             return None
         
         my_item = my_response[0]
-        if my_cache is not None:
-            self.__write_to_cache__(my_filename, my_item)
+        if my_cache_dir is not None:
+            id_filename  = f"{my_cache_dir}/{urllib.parse.quote(my_item['id'], safe='').lower()}.json"
+            self.__write_to_cache__(id_filename, my_item)
+
+        my_cache[my_item['id']]   = my_item
+        my_cache[my_item[my_key]] = my_item
         return my_item
     
-    def __get_all__(self, my_type, my_cache, my_key, STOP_LIMIT=None):
+    def __get_all__(self, my_type, my_cache, my_cache_dir, my_key, STOP_LIMIT=None):
         count      = 0
         my_list    = []
         my_limit   = 100000
-        if STOP_LIMIT is not None:
-            my_limit = STOP_LIMIT
-        if my_cache is not None:
-            json_files = glob.glob(os.path.join(my_cache, "*.json"))
+        if STOP_LIMIT is not None: my_limit = STOP_LIMIT
+        if my_cache_dir is not None:
+            json_files = glob.glob(os.path.join(my_cache_dir, "*.json"))
             if (len(json_files) > 0):
                 self.logger.debug(f"USING CACHED FILES: {len(json_files)}")
                 for json_file in json_files:
                     if count >= my_limit:
                         break
-                    my_list.append(self.__load_json_file__(json_file))
+                    data = self.__load_json_file__(json_file)
+                    my_list.append(data)
+                    my_cache[data['id']]   = data
+                    my_cache[data[my_key]] = data
                 return my_list
             
         ## TODO: implement stoplimit properly
         next_uri = f"{self.graph_api_url}/v1.0/{my_type}"
+        query = {}
+        if my_type == "users":
+            ## for users we want to get more data
+            query["$select"] = 'businessPhones,displayName,givenName,jobTitle,mail,mobilePhone,officeLocation,preferredLanguage,surname,userPrincipalName,id,proxyAddresses,mailNickname,accountEnabled'
         while next_uri:
             self.logger.debug(f"Getting {my_type} from {next_uri}")
-            response = requests.get(next_uri, headers=self.headers)
+            response = requests.get(next_uri, headers=self.headers, params=query)
             if response.status_code != 200:
                 self.logger.warning(f"{self.__class__.__name__}.{self.__caller_info__()}() Failed to retrieve all {my_type} ({response.json()})")
                 return None
             data = response.json()
             my_list.extend(data.get('value', []))
             next_uri = data.get('@odata.nextLink')
-        for item in my_list:
-            if my_cache is not None:
-                self.__write_to_cache__(f"{my_cache}/{urllib.parse.quote(item[my_key], safe='').lower()}.json", item)
+            query = {}  # we only need the params on the first request - fails if we keep it set
+        for data in my_list:
+            my_cache[data['id']]   = data
+            my_cache[data[my_key]] = data
+            if my_cache_dir is not None:
+                self.__write_to_cache__(f"{my_cache_dir}/{urllib.parse.quote(data['id'], safe='').lower()}.json", data)
         return my_list
     
     def __caller_info__(self):
@@ -265,22 +295,13 @@ class EntraClient:
                 for email in user_emails:
                     self.get_oid(email)
 
-        def get_details(self, email):
-            email = email.lower()
-            if email in self.cache:
-                return self.cache[email]
-            item = self.client.__get_details__(email, "users", self.users_cache_dir, "userPrincipalName")
-            self.cache[email] = item
-            return item
+        def get_details(self, email, FORCE_NEW=False):
+            return self.client.__get_details__(email.lower(), "users", self.cache, self.users_cache_dir, "userPrincipalName", FORCE_NEW)
 
         def get_oid(self, email):
-            email = email.lower()
-            if email in self.cache:
-                return self.cache[email]
             data = self.get_details(email)
             if data is not None:
                 oid = data.get("id")
-                self.cache[email] = oid
                 return oid
             return None
         
@@ -295,33 +316,85 @@ class EntraClient:
             return [self.cache.get(email) for email in user_emails if self.cache.get(email) is not None]
         
         def get_all(self, STOP_LIMIT=None):
-            return self.client.__get_all__("users", self.users_cache_dir, 'userPrincipalName', STOP_LIMIT)
+            return self.client.__get_all__("users", self.cache, self.users_cache_dir, 'userPrincipalName', STOP_LIMIT)
         
-        def principal_name_lower_case(self, email):
-            # self.client.logger.debug(f"User ID: {email} --> {email.lower()}")
-            if email is None:
-                return None
-            
-            ## for this use case we need to call the graph API to get the user details and not pull from cache
-            next_uri = f"{self.client.graph_api_url}/v1.0/users/{email}"
-            data = { "userPrincipalName": email.lower() }
-            response = requests.patch(next_uri, headers=self.client.headers, json=data)
-            if response.status_code == 204:
-                self.client.logger.info(f"Updated userPrincipalName ({email}) --> ({email.lower()})")
-            else:
-                self.client.logger.warning(f"Failed to update userPrincipalName for user {email}: {response.status_code} - {response.text}")
-                return None
+        def user_fields_lower_case(self, id):
+            if id is None: return False     
+            user_data       = self.get_details(id)
+            if user_data is None: return False
+            # self.client.logger.debug(f"Checking user ID: {id} / {user_data['userPrincipalName']}")
 
-            response = requests.get(next_uri, headers=self.client.headers)  
-            if response.status_code == 200:
-                data = response.json()
-            else:
-                self.client.logger.warning(f"{self.__class__.__name__}.{self.client.__caller_info__()}({email}) Failed to retrieve user info")
-                return None
-            
-            if self.users_cache_dir is not None:
-                self.client.__write_to_cache__(f"{self.users_cache_dir}/{urllib.parse.quote(email, safe='').lower()}.json", data)
-            return data
+            # we get the extra data for the user(s) given the way we call the graph API -- see above query/params
+            if 'accountEnabled' in user_data and user_data['accountEnabled'] is False:
+                self.client.logger.info(f"Skipping disabled user {id} / {user_data['userPrincipalName']}")
+                return False
+
+            data_before = {}
+            data_after = {}
+            FLIP=False
+            if 'userPrincipalName' in user_data and user_data['userPrincipalName'] is not None:
+                if any(char.isupper() for char in user_data['userPrincipalName']):
+                    data_before['userPrincipalName']  = user_data['userPrincipalName']
+                    data_after['userPrincipalName']   = user_data['userPrincipalName'].lower()
+                    FLIP=True
+
+            # mail thinks it can be changed but it doesn't take effect
+            # if 'mail' in user_data and user_data['mail'] is not None:
+            #     if any(char.isupper() for char in user_data['mail']):
+            #         data_before["mail"]               = user_data['mail']
+            #         data_after["mail"]                = user_data['mail'].lower()
+            #         FLIP=True
+
+            if 'mailNickname' in user_data and user_data['mailNickname'] is not None:
+                if any(char.isupper() for char in user_data['mailNickname']):
+                    data_before["mailNickname"]       = user_data['mailNickname']
+                    data_after["mailNickname"]        = user_data['mailNickname'].lower()
+                    FLIP=True
+
+            # Error : "Property 'proxyAddresses' is read-only and cannot be set."
+            # PROXY=False
+            # if 'proxyAddresses' in user_data and user_data['proxyAddresses'] is not None:
+            #     if len(user_data['proxyAddresses']) > 0:
+            #         new_proxyaddresses = []
+            #         for proxyaddress in user_data['proxyAddresses']:
+            #             if not ":" in proxyaddress:
+            #                 new_proxyaddresses.append(proxyaddress)
+            #             else:
+            #                 smtp  = proxyaddress.split(":")[0]
+            #                 email = proxyaddress.split(":")[1]
+            #                 if any(char.isupper() for char in email):
+            #                     new_email = email.lower()
+            #                     proxyaddress = f"{smtp}:{new_email}"
+            #                     new_proxyaddresses.append(proxyaddress)
+            #                     PROXY=True
+            #                 else:
+            #                     new_proxyaddresses.append(proxyaddress)
+            #         if PROXY:
+            #             ## only update if we have a change for proxyaddresses                    
+            #             data_before["proxyAddresses"]     = user_data['proxyAddresses']
+            #             data_after["proxyAddresses"]      = new_proxyaddresses
+            #             FLIP=True
+
+            if FLIP:
+                next_uri = f"{self.client.graph_api_url}/v1.0/users/{id}"
+                combined_dict = {
+                    "next_url": next_uri,
+                    "before": data_before,
+                    "payload": data_after
+                }
+                self.client.logger.debug(json.dumps(combined_dict, indent=4))
+
+                # actually update
+                response = requests.patch(next_uri, headers=self.client.headers, json=data_after)
+                if response.status_code != 204:
+                    self.client.logger.warning(f"Failed to lowercase for user {id}: {response.status_code} - {response.text}")
+                    return False
+
+                # force update the cache
+                user_data = self.get_details(id, True)
+                if user_data is None: return False
+                return True
+            return False
 
         def __str__(self):
             return f"{self.cache}"
@@ -347,22 +420,16 @@ class EntraClient:
                 self.sp_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
 
         def get_details(self, app):
-            if app in self.cache:
-                return self.cache[app]
-            item = self.client.__get_details__(app, "applications", self.apps_cache_dir, "displayName")
-            self.cache[app] = item
-            return item
-        def get_service_principal_details(self, app):
-            if app in self.sp_cache:
-                return self.sp_cache[app]
-            item = self.client.__get_details__(app, "servicePrincipals", self.sp_cache_dir, "displayName")
-            self.sp_cache[app] = item
-            return item
+            return self.client.__get_details__(app, "applications", self.cache, self.apps_cache_dir, "displayName")
         
         def get_all(self, STOP_LIMIT=None):
-            return self.client.__get_all__("applications", self.apps_cache_dir, 'displayName', STOP_LIMIT)
+            return self.client.__get_all__("applications", self.cache, self.apps_cache_dir, 'displayName', STOP_LIMIT)
+
+        def get_service_principal_details(self, app):
+            return self.client.__get_details__(app, "servicePrincipals", self.sp_cache, self.sp_cache_dir, "displayName")
+            
         def get_all_service_principals(self, STOP_LIMIT=None):
-            return self.client.__get_all__("servicePrincipals", self.sp_cache_dir, 'displayName', STOP_LIMIT)
+            return self.client.__get_all__("servicePrincipals", self.sp_cache, self.sp_cache_dir, 'displayName', STOP_LIMIT)
         
         def get_id(self, app_name):
             app_info = self.get_details(app_name)
@@ -724,14 +791,10 @@ class EntraClient:
                 self.groups_members_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups_members')
 
         def get_details(self, group):
-            if group in self.cache:
-                return self.cache[group]
-            item = self.client.__get_details__(group, "groups", self.groups_cache_dir, "displayName")
-            self.cache[group] = item
-            return item
+            return self.client.__get_details__(group, "groups", self.cache, self.groups_cache_dir, "displayName")
         
         def get_all(self, STOP_LIMIT=None):
-            return self.client.__get_all__("groups", self.groups_cache_dir, 'displayName', STOP_LIMIT)
+            return self.client.__get_all__("groups", self.cache, self.groups_cache_dir, 'displayName', STOP_LIMIT)
         
         def get_all_members(self, STOP_LIMIT=None):
             if self.groups_cache_dir is None:
@@ -792,8 +855,7 @@ class EntraClient:
                 else:
                     self.client.logger.warning(f"{self.__class__.__name__}.{self.client.__caller_info__()}() Failed to get members for group '{group_id}': {response.text}")
                     return []
-            if self.groups_cache_dir is not None:
-                self.client.__write_to_cache__(group_members_filename, members)
+            self.client.__write_to_cache__(group_members_filename, members)
             return members
         
         def __add_users__(self, group_id, membership_list):

@@ -35,11 +35,11 @@ import gzip
 
 ###################################################################################
 class OktaInfo:
-    def __init__ (self, CACHE_DIR, OKTA_DOMAIN=None, OKTA_TOKEN=None, GLOBAL_RATE_LIMIT=48, FLUSH=False):
+    def __init__ (self, CACHE_DIR, OKTA_DOMAIN=None, OKTA_TOKEN=None, GLOBAL_RATE_LIMIT=250, FLUSH=False):
         ## make sure that other modules are calling with same logger name
         self.logger                  = logging.getLogger('__COMMONLOGGER__')
         self.OKTA_DOMAIN             = OKTA_DOMAIN
-        self.GLOBAL_RATE_LIMIT       = GLOBAL_RATE_LIMIT
+        self.GLOBAL_RATE_LIMIT       = GLOBAL_RATE_LIMIT   # rate limits are fairly low anything from 50/min to 100/min per token
         self.total_apps_to_fetch     = 999999
         self.LIMIT_APPS              = 200
         self.LIMIT_USERS             = 500
@@ -167,17 +167,17 @@ class OktaInfo:
                 return users[0]['id']
         return None
 
-    def user(self, id):
+    def user(self, id, FORCE=False):
         # self.logger.debug(f"Getting user: {id}")
         if self.__is_email_address__(id):
             id = self.__get_user_id_by_email__(id)
             if id is None:
                 return None
-        if id in self.cache_user:
+        if FORCE is False and id in self.cache_user:
             return self.cache_user[id]
         url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
         filename = f"{self.dir_users}/{id}.json"
-        user_info = self.__fetch_to_cache__(url, filename)
+        user_info = self.__fetch_to_cache__(url, filename, FORCE)
         self.cache_user[id] = user_info
         return user_info
     # now that we have the id - we can get the apps for this user - for reference
@@ -274,48 +274,44 @@ class OktaInfo:
     def user_login_lower_case(self, id):
         ## this is a special case where we are changing the login name to lower case
         ## we need to refetch from the API and then change and then a PUT
-        self.logger.debug(f"Getting user: {id}")        
-        # url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
-        # response = self.__https_get__(url)
-        response = self.user(id)
-        if response:
-            # user = response.json()
-            user = response
+        self.logger.debug(f"Getting user: {id}")
+        response_json = self.user(id)
+        if response_json:
+            if response_json['status'] == "DEPROVISIONED": 
+                return False
+
             query = { "strict": "true" }
             payload = { "profile": {} }
             before = { "profile": {} }
 
-            LOGIN=False
-            if 'profile' in user and 'login' in user['profile']:
-                if any(char.isupper() for char in user['profile']['login']):
-                    before["profile"]["login"]               = user['profile']['login']
-                    payload["profile"]["login"]              = user['profile']['login'].lower()
-                    user['profile']['login']                 = user['profile']['login'].lower()
-                    LOGIN=True
+            FLIP=False
+            if 'profile' in response_json and 'login' in response_json['profile']:
+                if any(char.isupper() for char in response_json['profile']['login']):
+                    before["profile"]["login"]               = response_json['profile']['login']
+                    payload["profile"]["login"]              = response_json['profile']['login'].lower()
+                    response_json['profile']['login']        = response_json['profile']['login'].lower()
+                    FLIP=True
                     
-            EMAIL=False
-            if 'profile' in user and 'email' in user['profile']:
-                if any(char.isupper() for char in user['profile']['email']):
-                    before["profile"]["email"]               = user['profile']['email']
-                    payload["profile"]["email"]              = user['profile']['email'].lower()
-                    user['profile']['email']                 = user['profile']['email'].lower()
-                    EMAIL=True
+            if 'profile' in response_json and 'email' in response_json['profile']:
+                if any(char.isupper() for char in response_json['profile']['email']):
+                    before["profile"]["email"]               = response_json['profile']['email']
+                    payload["profile"]["email"]              = response_json['profile']['email'].lower()
+                    response_json['profile']['email']        = response_json['profile']['email'].lower()
+                    FLIP=True
 
-            EMP=False
-            if 'profile' in user and 'employeeNumber' in user['profile']:
-                if len(user['profile']['employeeNumber']) > 0:
-                    if any(char.isupper() for char in user['profile']['employeeNumber']):
-                        before["profile"]["employeeNumber"]  = user['profile']['employeeNumber']
-                        payload["profile"]["employeeNumber"] = user['profile']['employeeNumber'].lower()
-                        user['profile']['employeeNumber']    = user['profile']['employeeNumber'].lower()
-                        EMP=True
+            if 'profile' in response_json and 'employeeNumber' in response_json['profile']:
+                if len(response_json['profile']['employeeNumber']) > 0:
+                    if any(char.isupper() for char in response_json['profile']['employeeNumber']):
+                        before["profile"]["employeeNumber"]  = response_json['profile']['employeeNumber']
+                        payload["profile"]["employeeNumber"] = response_json['profile']['employeeNumber'].lower()
+                        response_json['profile']['employeeNumber'] = response_json['profile']['employeeNumber'].lower()
+                        FLIP=True
 
             PROXY=False
-            if 'profile' in user and 'proxyaddresses' in user['profile']:
-                if len(user['profile']['proxyaddresses']) > 0:
-                    before["profile"]["proxyaddresses"]      = user['profile']['proxyaddresses']
+            if 'profile' in response_json and 'proxyaddresses' in response_json['profile']:
+                if len(response_json['profile']['proxyaddresses']) > 0:
                     new_proxyaddresses = []
-                    for proxyaddress in user['profile']['proxyaddresses']:
+                    for proxyaddress in response_json['profile']['proxyaddresses']:
                         if not ":" in proxyaddress:
                             new_proxyaddresses.append(proxyaddress)
                         else:
@@ -325,32 +321,36 @@ class OktaInfo:
                                 new_email = email.lower()
                                 proxyaddress = f"{smtp}:{new_email}"
                                 new_proxyaddresses.append(proxyaddress)
+                                PROXY=True
                             else:
                                 new_proxyaddresses.append(proxyaddress)
-                    payload["profile"]["proxyaddresses"]     = new_proxyaddresses
-                    user['profile']['proxyaddresses']        = new_proxyaddresses
-                    PROXY=True
+                    if PROXY:
+                        ## only update if we have a change for proxyaddresses                    
+                        before["profile"]["proxyaddresses"]        = response_json['profile']['proxyaddresses']
+                        payload["profile"]["proxyaddresses"]       = new_proxyaddresses
+                        response_json['profile']['proxyaddresses'] = new_proxyaddresses
+                        FLIP=True
 
-            if LOGIN and EMAIL and EMP and PROXY:
+            if FLIP  :
                 combined_dict = {
                     "query": query,
                     "before": before,
                     "payload": payload
                 }
-                print(json.dumps(combined_dict, indent=4))
-                print("=-"*40)
-            # response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
-            # if response.status_code != 200:
-            #     self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
-            #     return None
-
-            return None
+                self.logger.debug(json.dumps(combined_dict, indent=4))
+                self.logger.debug("=-"*40)
+                url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}'
+                response = requests.post(url, json=payload, headers=self.__get_headers__(), params=query)
+                if response.status_code != 200:
+                    self.logger.error(f"Failed to update ({url}) Status: {response.status_code} / {response.json()}")
+                    return False
                        
-            ## clear cache file && re-write so in local cache as updated
-            filename = f"{self.dir_users}/{id}.json"
-            with open(filename, 'w') as f:
-                json.dump(response.json(), f)
-            return response.json()
+                ## clear cache file && re-write so in local cache as updated
+                self.user(id, True)
+
+                # if PROXY: exit(0)
+                return True
+        return False
         
     def user_set_password(self, id, password):
         ## MIGHT want to instead use this endpoint: https://developer.okta.com/docs/reference/api/authn/#reset-password
