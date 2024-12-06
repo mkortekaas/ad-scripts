@@ -267,9 +267,8 @@ class OktaInfo:
                     break
         return my_list
     
-    def users_fetch_all(self, STOP_LIMIT=None):
+    def users_fetch_all(self, STOP_LIMIT=999999):
         return self.__fetch_all__("users", self.cache_user, self.dir_users, STOP_LIMIT)
-
     
     def user_login_lower_case(self, id):
         ## this is a special case where we are changing the login name to lower case
@@ -468,12 +467,20 @@ class OktaInfo:
             url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/lifecycle/activate'   ## POST
         else:
             url =  f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}/lifecycle/deactivate' ## POST
-        self.logger.info(f"========== Flipping APP: {url} ==========")
-        response = requests.post(url, headers=self.__get_headers__())
-        if response.status_code != 200:
-            self.logger.warning(f"with change: {url} - response: {response}")
-            return False
-        return True
+        self.logger.debug(f"========== Flipping APP: {url} ==========")
+        while True:
+            response = requests.post(url, headers=self.__get_headers__())
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 429:
+                reset_time = int(response.headers.get('X-Rate-Limit-Reset', time.time() + 60))
+                wait_time = reset_time - int(time.time())
+                self.logger.warning(f"RATE_LIMIT_EXCEEDED - Waiting for {wait_time} seconds before retrying.")
+                time.sleep(wait_time)
+            else:
+                self.logger.warning(f"with change: {url} - response: {response}")
+                return False
+            return True
     
     def app_allow_reveal(self, id):
         url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}'
@@ -498,7 +505,7 @@ class OktaInfo:
         self.app(id, True)  ## force cache update post change
         return True
 
-    def apps_fetch(self, STOP_LIMIT=None):
+    def apps_fetch(self, STOP_LIMIT=999999):
         return self.__fetch_all__("apps", self.cache_apps, self.dir_app_info, STOP_LIMIT)
 
     # Function to get users for a given app ID

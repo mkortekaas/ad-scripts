@@ -310,10 +310,13 @@ class EntraClient:
                 user_emails = [user_emails]
             user_emails = list(set(user_emails))  # Remove duplicates
             user_emails = [email.lower() for email in user_emails]  # Lowercase all email addresses
+            oids = []
             for email in user_emails:
-                self.get_oid(email)
-            ## Note this will not return if the email does not exist in the cache
-            return [self.cache.get(email) for email in user_emails if self.cache.get(email) is not None]
+                data = self.get_details(email)
+                if data is not None:
+                    oid = data.get("id")
+                    oids.append(oid)
+            return oids
         
         def get_all(self, STOP_LIMIT=None):
             return self.client.__get_all__("users", self.cache, self.users_cache_dir, 'userPrincipalName', STOP_LIMIT)
@@ -416,8 +419,7 @@ class EntraClient:
             self.apps_cache_dir = None
             if (self.client.cache_dir is not None):
                 self.apps_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_apps')
-            if (self.client.cache_dir is not None):
-                self.sp_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
+                self.sp_cache_dir   = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
 
         def get_details(self, app):
             return self.client.__get_details__(app, "applications", self.cache, self.apps_cache_dir, "displayName")
@@ -786,8 +788,7 @@ class EntraClient:
             self.groups_cache_dir = None
             self.groups_members_cache_dir = None
             if (self.client.cache_dir is not None):
-                self.groups_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups')
-            if (self.client.cache_dir is not None):
+                self.groups_cache_dir         = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups')
                 self.groups_members_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_groups_members')
 
         def get_details(self, group):
