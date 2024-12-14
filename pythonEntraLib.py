@@ -68,10 +68,8 @@ class EntraClient:
         )
         result = app.acquire_token_for_client(scopes=self.required_scopes)
         if "access_token" not in result:
-            self.logger.critical("Failed to acquire token")
-            self.logger.error("Failed to acquire token")
-            self.logger.debug(result.get("error"))
-            self.logger.debug(result.get("error_description"))
+            self.logger.critical(f"FAILED TO ACQUIRE TOKEN: {result.get("error")}")
+            self.logger.critical(result.get("error_description"))
             raise Exception("Failed to acquire token")
         self.access_token = result["access_token"]
         self.headers = {
@@ -224,7 +222,10 @@ class EntraClient:
             self.__write_to_cache__(id_filename, my_item)
 
         my_cache[my_item['id']]   = my_item
-        my_cache[my_item[my_key]] = my_item
+        if my_type == "users":
+            my_cache[my_item[my_key].lower()] = my_item
+        else:
+            my_cache[my_item[my_key]] = my_item
         return my_item
     
     def __get_all__(self, my_type, my_cache, my_cache_dir, my_key, STOP_LIMIT=None):
@@ -242,7 +243,10 @@ class EntraClient:
                     data = self.__load_json_file__(json_file)
                     my_list.append(data)
                     my_cache[data['id']]   = data
-                    my_cache[data[my_key]] = data
+                    if my_type == "users":
+                        my_cache[data[my_key].lower()] = data
+                    else:
+                        my_cache[data[my_key]] = data
                 return my_list
             
         ## TODO: implement stoplimit properly
@@ -417,18 +421,19 @@ class EntraClient:
             self.cache            = {}
             self.sp_cache         = {}
             self.apps_cache_dir = None
+            self.sp_cache_dir   = None
             if (self.client.cache_dir is not None):
                 self.apps_cache_dir = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_apps')
                 self.sp_cache_dir   = self.client.__mkdir_p__(f'{self.client.cache_dir}/entra_service_principals')
 
-        def get_details(self, app):
-            return self.client.__get_details__(app, "applications", self.cache, self.apps_cache_dir, "displayName")
+        def get_details(self, app, FORCE_NEW=False):
+            return self.client.__get_details__(app, "applications", self.cache, self.apps_cache_dir, "displayName", FORCE_NEW)
         
         def get_all(self, STOP_LIMIT=None):
             return self.client.__get_all__("applications", self.cache, self.apps_cache_dir, 'displayName', STOP_LIMIT)
 
-        def get_service_principal_details(self, app):
-            return self.client.__get_details__(app, "servicePrincipals", self.sp_cache, self.sp_cache_dir, "displayName")
+        def get_service_principal_details(self, app, FORCE_NEW=False):
+            return self.client.__get_details__(app, "servicePrincipals", self.sp_cache, self.sp_cache_dir, "displayName", FORCE_NEW)
             
         def get_all_service_principals(self, STOP_LIMIT=None):
             return self.client.__get_all__("servicePrincipals", self.sp_cache, self.sp_cache_dir, 'displayName', STOP_LIMIT)

@@ -70,6 +70,8 @@ class OktaInfo:
             self.api_call_timestamps = None        
 
     def __mkdirs__(self):
+        if self.CACHE_DIR is None:
+            return
         self.dir_app_groups          = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_app_groups")
         self.dir_app_info            = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_app_info")
         self.dir_app_users           = self.__mkdir_p__(f"{self.CACHE_DIR}/okta_app_users")
@@ -226,6 +228,29 @@ class OktaInfo:
         with gzip.open(filename, "wt") as f:
             f.write(json.dumps(all_logs))
         return all_logs
+    
+    def __fetch_all_sub__(self, my_function, my_cache, my_cache_dir, STOP_LIMIT, url, query, my_list, count):
+        while True:
+            if count >= STOP_LIMIT:
+                break
+            self.logger.info(f"========== Fetching {my_function}: {url} ==========")
+            response = self.__https_get__(url, query)
+            items = response.json()
+            my_list.extend(items)
+            for item in items:
+                filename = f"{my_cache_dir}/{item.get('id')}.json"
+                my_cache[item.get('id')] = item
+                with open(filename, 'w') as f:
+                    json.dump(item, f)
+
+            count += len(items)
+            if 'next' in response.links:
+                self.logger.debug(f"                          {response.links['next']} ")
+                url = response.links['next']['url']
+                query = None
+            else:
+                break
+        return my_list
 
     def __fetch_all__(self, my_function, my_cache, my_cache_dir, STOP_LIMIT):
         count     = 0
@@ -245,26 +270,18 @@ class OktaInfo:
                     my_cache[data.get('id')] = data
                     count += 1
         else:
-            url = f'https://{self.OKTA_DOMAIN}/api/v1/{my_function}?limit={my_limit}'
-            while True:
-                if count >= STOP_LIMIT:
-                    break
-                self.logger.info(f"========== Fetching {my_function}: {url} ==========")
-                response = self.__https_get__(url)
-                items = response.json()
-                my_list.extend(items)
-                for item in items:
-                    filename = f"{my_cache_dir}/{item.get('id')}.json"
-                    my_cache[item.get('id')] = item
-                    with open(filename, 'w') as f:
-                        json.dump(item, f)
-
-                count += len(items)
-                if 'next' in response.links:
-                    self.logger.debug(f"                          {response.links['next']} ")
-                    url = response.links['next']['url']
-                else:
-                    break
+            url = f'https://{self.OKTA_DOMAIN}/api/v1/{my_function}'
+            query = {
+                "limit": my_limit
+            }
+            self.__fetch_all_sub__(my_function, my_cache, my_cache_dir, STOP_LIMIT, url, query, my_list, count)
+            if my_function == "users":
+                query = {
+                    "limit": my_limit,
+                    "filter": "status eq \"DEPROVISIONED\""   ## we need to get deprovisioned users as well
+                }
+                self.__fetch_all_sub__(my_function, my_cache, my_cache_dir, STOP_LIMIT, url, query, my_list, count)
+            ## apps DELETED status seems to only return active/inactive apps anyway?
         return my_list
     
     def users_fetch_all(self, STOP_LIMIT=999999):
@@ -374,6 +391,22 @@ class OktaInfo:
         url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}/appLinks'
         response = self.__https_get__(url)
         return response.json()
+    
+    def user_lifecycle_change(self, id, lifecycle):
+        url = f'https://{self.OKTA_DOMAIN}/api/v1/users/{id}/lifecycle/{lifecycle}'
+        while True:
+            response = requests.post(url, headers=self.__get_headers__())
+            if response.status_code == 200:
+                self.logger.info(f"User status changed: {url} - response: {response.status_code} / {response.text}")
+                return True
+            elif response.status_code == 429:
+                reset_time = int(response.headers.get('X-Rate-Limit-Reset', time.time() + 60))
+                wait_time = reset_time - int(time.time())
+                self.logger.warning(f"RATE_LIMIT_EXCEEDED - Waiting for {wait_time} seconds before retrying.")
+                time.sleep(wait_time)
+            else:
+                self.logger.warning(f"Failed to flip user: {url} - response: {response.status_code} / {response.text}")
+                return False
 
     def groups(self, id):
         if id in self.cache_groups:
@@ -480,7 +513,6 @@ class OktaInfo:
             else:
                 self.logger.warning(f"with change: {url} - response: {response}")
                 return False
-            return True
     
     def app_allow_reveal(self, id):
         url = f'https://{self.OKTA_DOMAIN}/api/v1/apps/{id}'
