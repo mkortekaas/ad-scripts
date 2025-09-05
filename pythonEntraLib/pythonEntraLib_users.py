@@ -189,6 +189,66 @@ class Users:
         data = response.json()
         return data
 
+    def create(self, principal_name, display_name, password, force_change_password_next_sign_in=True, 
+        first_name=None, last_name=None, alternative_email=None, accountEnabled=True, company_name=None):
+
+        if principal_name is None:
+            self.client.logger.warning("Principal name is required")
+            return None
+        if display_name is None:
+            self.client.logger.warning("Display name is required")
+            return None
+        if password is None:
+            self.client.logger.warning("Password is required")
+            return None
+
+        user_data = self.get_details(principal_name)
+        if user_data is not None:
+            print(json.dumps(user_data, indent=4))
+            self.client.logger.warning(f"User {principal_name} already exists")
+            return None
+
+        passwordPolicy = {
+            "forceChangePasswordNextSignIn": force_change_password_next_sign_in,
+            "password": password,
+        }
+        payload = {
+            "accountEnabled": accountEnabled,
+            "displayName": display_name,
+            "mailNickname": principal_name.split('@')[0],
+            "passwordProfile": passwordPolicy,
+            "userPrincipalName": principal_name,
+            "mail": principal_name,
+            # "proxyAddresses": [f"SMTP:{principal_name}"],
+        }
+        if first_name is not None:
+            payload["givenName"] = first_name
+        if last_name is not None:
+            payload["surname"] = last_name
+        if alternative_email is not None:
+            payload["otherMails"] = [alternative_email]
+        if company_name is not None:
+            payload["companyName"] = company_name
+
+        next_uri = f"{self.client.graph_api_url}/v1.0/users"
+        response = requests.post(next_uri, headers=self.client.headers, json=payload)
+        if response.status_code != 201:
+            self.client.logger.warning(f"Failed to create user: {response.status_code} - {response.text}")
+            return None
+        return response.json()
+
+    def delete(self, principal_name):
+        if principal_name is None: return False
+        user_oid     = self.get_oid(principal_name)
+        if user_oid is None: return False
+        next_uri = f"{self.client.graph_api_url}/v1.0/users/{user_oid}"
+        print(f"Deleting user {principal_name} ({user_oid})")
+        response = requests.delete(next_uri, headers=self.client.headers)
+        if response.status_code != 204:
+            self.client.logger.warning(f"Failed to delete user {principal_name} ({user_oid}): {response.status_code} - {response.text}")
+            return False
+        return True
+
     def __str__(self):
         return f"{self.cache}"
 
