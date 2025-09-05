@@ -33,6 +33,7 @@ import glob
 import inspect
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from azure.identity import AzureCliCredential
 
 from .pythonEntraLib_users import Users
 from .pythonEntraLib_applications import Applications
@@ -40,14 +41,14 @@ from .pythonEntraLib_groups import Groups
 from .pythonEntraLib_passwordSSO import PasswordSSO
 
 class EntraClient:
-    def __init__(self, tenant_id, client_id, client_secret, required_scopes, graph_api_url, cache_dir=None, FLUSH=False):
+    def __init__(self, tenant_id, client_id=None, client_secret=None, required_scopes=None, graph_api_url=None, cache_dir=None, FLUSH=False):
         ## make sure that other modules are calling with same logger name
         self.logger          = logging.getLogger('__COMMONLOGGER__')
         self.tenant_id       = tenant_id
         self.client_id       = client_id
         self.client_secret   = client_secret
-        self.required_scopes = required_scopes
-        self.graph_api_url   = graph_api_url
+        self.required_scopes = required_scopes if required_scopes else ["https://graph.microsoft.com/.default"]
+        self.graph_api_url   = graph_api_url if graph_api_url else "https://graph.microsoft.com"
         self.cache_dir = f"{cache_dir}/{tenant_id}" if cache_dir else None
 
         if FLUSH:
@@ -67,21 +68,48 @@ class EntraClient:
         ##  so often
         ##
         self.logger.info("Authenticating with MS_GRAPH and getting valid token")
-        app = msal.ConfidentialClientApplication(
-            self.client_id,
-            authority=f"https://login.microsoftonline.com/{self.tenant_id}",
-            client_credential=self.client_secret,
-        )
-        result = app.acquire_token_for_client(scopes=self.required_scopes)
-        if "access_token" not in result:
-            self.logger.critical(f"FAILED TO ACQUIRE TOKEN")
-            self.logger.critical(result.get("error_description"))
-            raise Exception("Failed to acquire token")
-        self.access_token = result["access_token"]
-        self.headers = {
-            "Authorization": f"Bearer {result['access_token']}",
-            "Content-Type": "application/json",
-        }
+        
+        # Try service principal authentication first if client_secret is provided
+        if self.client_secret and self.client_id:
+            try:
+                self.logger.info("Attempting service principal authentication")
+                app = msal.ConfidentialClientApplication(
+                    self.client_id,
+                    authority=f"https://login.microsoftonline.com/{self.tenant_id}",
+                    client_credential=self.client_secret,
+                )
+                result = app.acquire_token_for_client(scopes=self.required_scopes)
+                if "access_token" in result:
+                    self.access_token = result["access_token"]
+                    self.headers = {
+                        "Authorization": f"Bearer {result['access_token']}",
+                        "Content-Type": "application/json",
+                    }
+                    self.logger.info("Service principal authentication successful")
+                    return
+                else:
+                    self.logger.warning(f"Service principal authentication failed: {result.get('error_description')}")
+            except Exception as e:
+                self.logger.warning(f"Service principal authentication failed with exception: {str(e)}")
+        
+        # Fall back to Azure CLI authentication
+        try:
+            self.logger.info("Attempting Azure CLI authentication")
+            credential = AzureCliCredential()
+            token = credential.get_token("https://graph.microsoft.com/.default")
+            self.access_token = token.token
+            self.headers = {
+                "Authorization": f"Bearer {token.token}",
+                "Content-Type": "application/json",
+            }
+            self.logger.info("Azure CLI authentication successful")
+            return
+        except Exception as e:
+            self.logger.critical(f"Azure CLI authentication failed: {str(e)}")
+        
+        # If both methods fail, raise an exception
+        self.logger.critical("All authentication methods failed")
+        raise Exception("Failed to acquire token using either service principal or Azure CLI authentication")
 
     def flush(self):
         self.logger.info(f"FLUSHING ENTRA CACHE in ({self.cache_dir})")
